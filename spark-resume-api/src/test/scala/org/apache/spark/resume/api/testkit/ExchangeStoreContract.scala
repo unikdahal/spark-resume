@@ -132,4 +132,30 @@ abstract class ExchangeStoreContract extends AnyFunSuite with Matchers {
     store.handleKind should not be empty
     store.handleKind shouldBe store.handleKind
   }
+
+  test("store/readPartition round-trips real bytes losslessly, OR is a documented " +
+    "UnsupportedOperationException for a declared Tier 3 backend") {
+    // Rides the SAME reattachSupported flag as the `reattach` test above, deliberately: a backend
+    // whose Tier 3 gap blocks reading a shuffle's committed locations under a foreign application
+    // identity has the identical capability requirement for store/readPartition (see
+    // ExchangeStore.store's own doc comment) -- no separate `storeSupported` flag exists, and
+    // adding one here would just invite a testkit user to declare TWO gaps for what is actually
+    // ONE checked backend limitation.
+    val store = newStore()
+    val partitions = Array(
+      Array[Byte](1, 2, 3),
+      Array[Byte](4, 5, 6, 7),
+      Array.emptyByteArray // a real, legitimate case: an empty partition, not a missing one
+    )
+    if (reattachSupported) {
+      val handle = store.store(partitions)
+      for (i <- partitions.indices) {
+        store.readPartition(handle, i).toSeq shouldBe partitions(i).toSeq
+      }
+      an[Exception] should be thrownBy store.readPartition(handle, partitions.length) // out of range
+    } else {
+      info("this implementation declares store/readPartition unsupported (Tier 3 backend gap) -- checking it fails closed, not silently")
+      an[UnsupportedOperationException] should be thrownBy store.store(partitions)
+    }
+  }
 }

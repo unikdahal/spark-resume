@@ -27,7 +27,9 @@ import org.apache.spark.resume.api._
   * clean-room, vanilla-Celeborn-only posture rules out. `reattach` throws
   * `UnsupportedOperationException` naming this gap explicitly; `SafeReattach.attempt`
   * (spark-resume-core) converts that into the structured `RefusedUnsupported` outcome, so a caller
-  * doing everything right gets a refusal, not a raw throw.
+  * doing everything right gets a refusal, not a raw throw. [[store]]/[[readPartition]] (added
+  * later than the rest of this class -- see `ExchangeStore.store`'s own doc comment) throw the
+  * same way, for the same reason: this store never touches shuffle bytes at all, read or write.
   *
   * @param masterRestBaseUrl e.g. `"http://localhost:9098"` -- the Celeborn master's admin REST
   *   endpoint (NOT its RPC port; a separate port, configured via `celeborn.master.http.host`/
@@ -97,6 +99,23 @@ final class CelebornExchangeStore(masterRestBaseUrl: String, callerAppUniqueId: 
         "than the one that registered it (ShuffleClient.readPartition/registerMapPartitionTask " +
         "are scoped to the registering LifecycleManager) -- this is docs/DESIGN.md §8's Tier 3, " +
         "a documented backend-patch requirement, not a bug in this store. See CelebornExchangeStore's doc comment.")
+
+  /** Same Tier 3 gap as [[reattach]], not a separate one: `store` would need to write shuffle
+    * data through Celeborn's real data-plane client (`LifecycleManager`/`ShuffleClient`) as this
+    * project's OWN producer, which this project deliberately does not build here -- see
+    * `docs/COMPATIBILITY.md`: `spark-resume-fs` is this repo's real `store`/`readPartition`
+    * backend, `spark-resume-celeborn` stays metadata-only. Not attempted, not silently degraded. */
+  override def store(partitions: Array[Array[Byte]]): ExchangeHandle =
+    throw new UnsupportedOperationException(
+      "CelebornExchangeStore.store: this store is metadata-only (see its own doc comment) -- " +
+        "it never writes shuffle bytes through Celeborn's data-plane client. This is the same " +
+        "Tier 3 gap as reattach, not a separate one. See CelebornExchangeStore's doc comment.")
+
+  override def readPartition(handle: ExchangeHandle, partitionId: Int): Array[Byte] =
+    throw new UnsupportedOperationException(
+      "CelebornExchangeStore.readPartition: this store is metadata-only (see its own doc " +
+        "comment) -- it never reads shuffle bytes through Celeborn's data-plane client. This is " +
+        "the same Tier 3 gap as reattach, not a separate one. See CelebornExchangeStore's doc comment.")
 }
 
 object CelebornExchangeStore {

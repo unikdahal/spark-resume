@@ -88,4 +88,48 @@ trait ExchangeStore {
     * [[org.apache.spark.resume.core.SafeReattach]] exists as the one path callers should use
     * instead of calling this directly. */
   def reattach(handle: ExchangeHandle): ReattachResult
+
+  /** PRODUCER-side: durably store `partitions` (one opaque byte blob per output partition, in
+    * partition-index order -- what those bytes MEAN is entirely a Spark-integration-layer concern;
+    * this trait has no Spark dependency and never interprets them) and return a handle a resuming
+    * process can later read the SAME bytes back through via [[readPartition]].
+    *
+    * Added later than the rest of this trait, deliberately: every other method here models only
+    * the RESUMING driver's operations (see this trait's own doc comment on why -- `handle`s are
+    * backend-owned, opaque, never producer-constructed by a caller). `store`/`readPartition` are
+    * the missing producer-side half, without which no `ExchangeStore` could ever be the thing a
+    * resuming driver actually reattaches real data through -- see
+    * `spark-resume-integration`'s `ProcessA`, which had to hand-build a `CelebornHandle` itself
+    * specifically because `CelebornExchangeStore` had no such method to call, and
+    * `spark-resume-spark-3.5`'s `StageCaptureListener`, which is correct to always write the
+    * `NoHandleKind` sentinel for exactly the same reason (docs/DESIGN.md §6 records this as a
+    * deliberate, later SPI addition, not an oversight in the original design).
+    *
+    * An implementation whose backend cannot support this at all (the same class of Tier 3 gap
+    * `reattach` already has a documented escape hatch for -- see
+    * `spark-resume-celeborn`'s `CelebornExchangeStore`, whose vanilla-Celeborn-client-API gap
+    * applies here identically, since writing under a foreign application identity has the exact
+    * same capability requirement as reading under one) MUST throw `UnsupportedOperationException`
+    * naming the gap explicitly, the same as `reattach` does -- never silently drop the data or
+    * return a handle that will fail later. No `storeSupported`-style testkit opt-out exists for
+    * this method the way `reattachSupported` does for `reattach`: unlike reattach (where a
+    * resuming driver calling a Tier-3-gapped backend is a normal, expected, routine outcome this
+    * project structurally handles via `SafeReattach`'s `RefusedUnsupported`), a PRODUCER unable to
+    * store its own output at all means that backend can never back a real anchor for anyone, which
+    * is a fact worth a loud, explicit exception at the one call site that would ever invoke it,
+    * not a routine, silently-tolerated outcome. */
+  def store(partitions: Array[Array[Byte]]): ExchangeHandle
+
+  /** The inverse of [[store]]: the exact bytes written for partition `partitionId` of `handle`.
+    * Callers MUST have already obtained [[IsolationOk]] from `checkIdentityIsolation` AND
+    * confirmed [[isFresh]] for this exact handle, the same precondition [[reattach]] has -- this
+    * method is not routed through `SafeReattach` itself (that choke point returns one
+    * `ReattachResult`, not per-partition bytes), so a caller building a real execution-skip path
+    * on top of this method is responsible for enforcing that precondition itself, the same way
+    * `SafeReattach.attempt` does for `reattach`.
+    *
+    * `partitionId` out of range for `handle`, or otherwise unreadable, MUST throw rather than
+    * return an empty/zero-length result that could be silently misread as "this partition really
+    * has no data" -- the same fail-loud posture [[reattach]]'s own doc comment requires. */
+  def readPartition(handle: ExchangeHandle, partitionId: Int): Array[Byte]
 }

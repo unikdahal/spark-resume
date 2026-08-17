@@ -14,9 +14,17 @@ final case class StageCandidate(digest: String, path: String)
 /** One capture-side materialized stage, with the REAL runtime statistics Spark itself recorded
   * for it -- not the whole-query placeholder [[SparkResumeListener]] is forced to write.
   * `bytesByPartition` is empty when `mapStats` was never populated (see the doc comment on why
-  * that happens and is not a bug). */
+  * that happens and is not a bug).
+  *
+  * @param plan the materialized `ShuffleQueryStageExec`'s own child plan (`s.plan`) -- added in
+  *   Phase 4, alongside real execution-skipping: a caller wanting to capture this stage's ACTUAL
+  *   row bytes (not just statistics), e.g. `StageCaptureListener`'s optional `exchangeStore` path,
+  *   needs a real `SparkPlan` to call `.execute()` on. Calling `.execute()` on an
+  *   already-materialized exchange is cheap, not a recomputation: `SparkPlan.execute()` memoizes
+  *   its RDD, so this re-reads the same already-computed shuffle output the query itself already
+  *   produced, rather than re-running any upstream computation. */
 final case class CapturedStage(digest: String, numMappers: Int, numPartitions: Int,
-                                bytesByPartition: Array[Long])
+                                bytesByPartition: Array[Long], plan: SparkPlan)
 
 /** Per-stage fingerprinting: the Tier-1-only degradation of the Tier 2 extension point
   * docs/DESIGN.md §8 proposes and Spark does not yet expose. There is no public hook that fires
@@ -102,6 +110,6 @@ object StageFingerprint {
         // assumed (a skipped/reused stage in a more complex plan is a real, if rare, case where
         // it would not be).
         val bytesByPartition = s.mapStats.map(_.bytesByPartitionId).getOrElse(Array.empty[Long])
-        CapturedStage(digest, s.shuffle.numMappers, s.shuffle.numPartitions, bytesByPartition)
+        CapturedStage(digest, s.shuffle.numMappers, s.shuffle.numPartitions, bytesByPartition, s.plan)
     }
 }

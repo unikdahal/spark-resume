@@ -66,6 +66,15 @@
       <artifactId>spark-resume-celeborn_2.12</artifactId>
       <version>${project.version}</version>
     </dependency>
+    <!-- The real cross-process, cross-backend execution-skip proof (scenario=skip) needs a
+         real, reattachable ExchangeStore's store/readPartition : spark-resume-fs, not
+         spark-resume-celeborn (whose reattach/store/readPartition are all the documented Tier 3
+         gap, see that module's README). -->
+    <dependency>
+      <groupId>org.apache.spark.resume</groupId>
+      <artifactId>spark-resume-fs_2.12</artifactId>
+      <version>${project.version}</version>
+    </dependency>
     <dependency>
       <groupId>org.apache.spark</groupId>
       <artifactId>spark-core_2.12</artifactId>

@@ -27,21 +27,33 @@ class FsExchangeStoreDirectSpec extends AnyFunSuite with Matchers {
 
   test("reattach detects a manifest/data size mismatch as real corruption, not silently trusting the manifest") {
     val slotId = s"corrupt-${UUID.randomUUID()}"
-    // Write a slot honestly, THEN truncate its data file on disk directly -- the exact "same-slot
-    // truncate-then-rewrite" failure shape ExchangeStore.isFresh's own doc comment warns a naive
-    // length-only check can't distinguish; this test checks reattach's own independent defense,
-    // not isFresh's.
+    // Write a slot honestly, THEN truncate ONE partition's data file on disk directly -- the exact
+    // "same-slot truncate-then-rewrite" failure shape ExchangeStore.isFresh's own doc comment warns
+    // a naive length-only check can't distinguish; this test checks reattach's own independent
+    // defense, not isFresh's. Two partitions, only one truncated, proves the check is genuinely
+    // PER-PARTITION, not just an aggregate sum that a compensating corruption elsewhere could evade.
     val handle = FsExchangeStore.writeSlot(
       baseDir, slotId,
-      numMappers = 1, numPartitions = 1,
-      bytesByPartition = Array(100L), rowCount = 5L, mapperAttempts = Array(0),
-      data = new Array[Byte](100))
-    val dataPath = java.nio.file.Paths.get(baseDir, slotId, s"gen-${handle.generation}.data")
-    Files.write(dataPath, new Array[Byte](50)) // truncate: manifest still claims 100 bytes
+      numMappers = 1, numPartitions = 2,
+      bytesByPartition = Array(100L, 40L), rowCount = 5L, mapperAttempts = Array(0),
+      data = new Array[Byte](140)) // 100 + 40, split across 2 partition files by writeSlot
+    val part0Path = java.nio.file.Paths.get(baseDir, slotId, s"gen-${handle.generation}.part-0.data")
+    Files.write(part0Path, new Array[Byte](50)) // truncate partition 0: manifest still claims 100 bytes
 
     val store = newStore()
     store.isFresh(handle) shouldBe true // generation marker is untouched -- isFresh alone can't catch this
     an[IllegalStateException] should be thrownBy store.reattach(handle)
+  }
+
+  test("readPartition reads back the exact bytes for the partition asked, not another one") {
+    val store = newStore()
+    val partitions = Array(Array[Byte](1, 2, 3), Array[Byte](9, 9), Array.emptyByteArray)
+    val handle = store.store(partitions)
+    store.readPartition(handle, 0).toSeq shouldBe Seq[Byte](1, 2, 3)
+    store.readPartition(handle, 1).toSeq shouldBe Seq[Byte](9, 9)
+    store.readPartition(handle, 2).toSeq shouldBe Seq.empty[Byte]
+    an[IndexOutOfBoundsException] should be thrownBy store.readPartition(handle, -1)
+    an[IndexOutOfBoundsException] should be thrownBy store.readPartition(handle, 3)
   }
 
   test("writeSlot generations are monotonic per slotId, independent across different slotIds") {

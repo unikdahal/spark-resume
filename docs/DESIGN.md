@@ -1,29 +1,26 @@
 # Design: a generic shuffle/stage resumption library for Apache Spark
 
-Status: **Phase 0, Phase 1, and Phase 2 done; Phase 3 underway** (one real backend done, honestly
-partial, plus a real cross-process composition proof, plus a second independent `ExchangeStore`
-proving the conformance testkit itself), with two known, disclosed gaps — an A-1 race in the
-Iceberg provider's unpinned-read path (§14 Phase 2) and a documented Tier 3 backend-capability gap
-in `spark-resume-celeborn`'s `reattach` (§14 Phase 3). `spark-resume-api` (the SPI),
-`spark-resume-core` (the admission engine + the identity-isolation-safe reattach path, now with a
-fourth `ReattachOutcome`, `RefusedUnsupported`), `spark-resume-spark-3.5` (Tier 1 Spark integration:
-whole-plan AND per-stage fingerprinting, capture, and admission-check, proven across two
-independent `SparkSession`s), `spark-resume-iceberg` (an Iceberg `SourceFingerprint`),
-`spark-resume-redis` (a real, cross-process `AnchorStore`), `spark-resume-celeborn` (a real,
-cross-process `ExchangeStore`'s metadata half), and `spark-resume-fs` (a second, independent
-`ExchangeStore`, filesystem-backed, no external infrastructure) are all built and tested —
-110/110 tests, reproduced clean across multiple full runs, verified 3x back-to-back with zero
-flakes (needs a real Redis and a real Celeborn cluster reachable — see each module's README), see
-the repo root README and each module's own README.
-`spark-resume-integration` (not counted in the 110; deliberately excluded from a bare `mvn install`
-— see §14 Phase 3 and its own README) adds a real TWO-PROCESS proof the whole pipeline composes
-against real backends, across FOUR real scenarios, verified 3x back-to-back (12/12 real process
-pairs, zero flakes). **Still no execution-skip mechanism built anywhere in this repository** —
-but, as of a Phase 4 correction (§8), no longer blocked on a missing Spark API either: a public
-Spark 3.5 hook (`injectQueryStagePrepRule`) proven, in a disclosed spike, to see a candidate stage
-before it materializes and to accept a leaf substitute that survives validation and produces
-correct results. What remains is real backend-read-path engineering, not an absent extension
-point. This document
+Status: **Phase 0–2 done, Phase 3 done (one real Tier 3 backend, honestly partial), Phase 4
+underway** — including a REAL execution-skip mechanism, not just decision-and-refusal plumbing,
+with two known, disclosed gaps remaining — an A-1 race in the Iceberg provider's unpinned-read
+path (§14 Phase 2) and a documented Tier 3 backend-capability gap covering `spark-resume-celeborn`'s
+`reattach`/`store`/`readPartition` alike (§14 Phase 3). `spark-resume-api` (the SPI, now including
+`store`/`readPartition`, §6), `spark-resume-core` (the admission engine + the identity-isolation-
+safe reattach path, a fourth `ReattachOutcome`, `RefusedUnsupported`), `spark-resume-spark-3.5`
+(Tier 1 Spark integration PLUS `RowBytesCodec`/`ExecutionSkipRule`/`SkippedShuffleRDD` — a real
+Spark stage genuinely skipped, not just admitted on paper), `spark-resume-iceberg`,
+`spark-resume-redis`, `spark-resume-celeborn` (metadata-real, bytes-path Tier 3), and
+`spark-resume-fs` (a second, independent `ExchangeStore`, and this repo's real proof target for
+execution-skipping) are all built and tested — see the repo root README and
+`docs/COMPATIBILITY.md` for the current whole-repo test count, reproduced clean across multiple
+full runs, verified 3x back-to-back with zero flakes (needs a real Redis and a real Celeborn
+cluster reachable — see each module's README).
+`spark-resume-integration` (deliberately excluded from a bare `mvn install` — see §14 Phase 3 and
+its own README) runs FIVE real scenarios across real process pairs, verified 3x back-to-back with
+zero flakes: four terminate in the documented Tier 3 refusal (Celeborn), and the fifth, `skip`, is
+a REAL execution skip across a real process boundary against `spark-resume-fs` — correct rows,
+strictly fewer Spark tasks, real bytes read from a file a SEPARATE, already-exited process wrote.
+This document
 specifies the architecture for the project as a whole — provisionally named `spark-resume` (see
 Appendix A) — that generalizes a mechanism proven across several proof-of-concept repositories
 into a real, pluggable, production-grade library. It intentionally contains no reference to any
@@ -237,6 +234,35 @@ case object IsolationOk extends IsolationResult
 case class IsolationConflict(reason: String) extends IsolationResult
 ```
 
+**Update, Phase 4: `store`/`readPartition` added, and `ExchangeHandle` now extends
+`Serializable`.** Every method above models only the RESUMING driver's operations -- there was no
+producer-side "issue me a handle" method at all, a real gap `spark-resume-integration`'s `ProcessA`
+had to work around by hand-building a `CelebornHandle` itself. Closed by adding two methods to
+`ExchangeStore`:
+
+```scala
+  /** PRODUCER-side: durably store one opaque byte blob per output partition, returning a handle
+    * a resuming process can later read the SAME bytes back through via readPartition. An
+    * implementation whose backend cannot support this (the identical Tier 3 capability class as
+    * `reattach`'s gap) MUST throw UnsupportedOperationException, the same as reattach does. */
+  def store(partitions: Array[Array[Byte]]): ExchangeHandle
+
+  /** The inverse of store: partition `partitionId`'s exact bytes. NOT routed through
+    * SafeReattach (which returns one ReattachResult, not per-partition bytes) -- a caller
+    * building a real execution-skip path on this method enforces isFresh/checkIdentityIsolation
+    * itself, the same preconditions SafeReattach would otherwise enforce for reattach. */
+  def readPartition(handle: ExchangeHandle, partitionId: Int): Array[Byte]
+```
+
+`ExchangeHandle extends Serializable` because a real execution-skip RDD ships a live handle to
+EXECUTORS (each partition's `compute()` reads its own bytes independently, not funneled through
+the driver) -- every concrete handle in this repo was already a plain case class over serializable
+fields, so this cost existing implementations nothing. `ExchangeStoreContract` gained a matching
+round-trip test, gated on the SAME `reattachSupported` flag (no separate `storeSupported` flag: one
+checked backend capability, not two to declare). See `spark-resume-fs`'s `store`/`readPartition`
+(real, per-partition files) and `spark-resume-celeborn`'s (both throw, same Tier 3 gap as
+`reattach`) for the two real implementations, and §8's correction below for what this unlocked.
+
 ```scala
 package org.apache.spark.resume.api
 
@@ -406,18 +432,38 @@ checked, not assumed, in a disclosed spike
    `output`/`outputPartitioning`/`outputOrdering` as the `Exchange` it replaces survives, and a
    downstream aggregation over the substituted subtree sums to the exact correct row count.
 
-**What this changes, precisely, and what it does NOT yet solve:** the long-standing "no
-execution-skip mechanism anywhere" status is no longer blocked at the Spark-API level for Spark
-3.5 — the interception point exists, is public, and has been proven to structurally work. What
-remains is real backend engineering, not a missing API: the spike's leaf node cheats by eagerly
-calling `ex.execute()` inside the rule and wrapping the result, still running the real shuffle
-once. Building a REAL skip requires a backend-aware `RDD` that reads actual partition bytes back
-from an `ExchangeStore.reattach` result inside `doExecute()` instead — real, substantial follow-on
-work (careful interaction with AQE's re-optimization-on-new-stats loop, columnar/broadcast
-variants, and only actually payable in production against a backend whose `reattach` is
-implemented — `spark-resume-celeborn`'s is not, `spark-resume-fs`'s is, making it this project's
-first buildable proof target). Not started as of this correction; a deliberate checkpoint, not
-an oversight — see the repo's own commit history for why.
+**What this changed, precisely:** the long-standing "no execution-skip mechanism anywhere" status
+was no longer blocked at the Spark-API level for Spark 3.5 — the interception point existed, was
+public, and had been proven to structurally work. What remained was real backend engineering, not
+a missing API: the spike's leaf node cheated by eagerly calling `ex.execute()` inside the rule and
+wrapping the result, still running the real shuffle once.
+
+**Follow-up, same phase: the real skip was built, not just spiked.** `RowBytesCodec` (Spark's own
+`UnsafeRow` binary format, length-prefixed per row — the same shape Spark's shuffle write path
+uses internally, not a bespoke format), `ExecutionSkipRule` (the production rule: makes the
+IDENTICAL admission decision `StageAdmissionCheck` would via the same digest and the same
+`AdmissionEngine` call, then substitutes a real `SkippedExchangeExec` only when the anchor's
+`handleKind` matches the store, `isFresh`, and `checkIdentityIsolation` all pass — falling through
+to normal execution on ANY failure, never a partial/unsafe substitution), and `SkippedShuffleRDD`
+(each partition's `compute()` runs ON THE EXECUTOR that consumes it, calling
+`ExchangeStore.readPartition` directly — no shuffle bytes funneled through the driver) replace the
+spike's cheat entirely. `StageCaptureListener` gained an optional `exchangeStore` parameter
+(`None` by default, preserving Phase 2's exact original behavior) that, when given a real store,
+reads a captured stage's ACTUAL materialized row bytes (`stage.plan.execute()` — cheap, re-reading
+already-computed shuffle output, not a recomputation) and calls `store.store(...)` for a real,
+reattachable handle.
+
+The acceptance test (`ExecutionSkipAcceptanceSpec`, `spark-resume-spark-3.5`) checks BOTH things a
+correct-results-only test could pass on even if the substitution silently fell through to normal
+execution: correct final rows AND fewer Spark tasks than an unresumed baseline. Observed for the
+fixture query (`range(4 partitions).repartition(3).collect()`): baseline 7 tasks, resumed 3 — the 4
+upstream shuffle-map tasks genuinely eliminated, not just reduced. Uses `InMemoryExchangeStore`
+(made `Serializable` for exactly this — see §6's update), keeping `spark-resume-spark-3.5` itself
+backend-agnostic. `spark-resume-integration`'s `skip` scenario reproduces the identical proof
+across a real OS process boundary against `spark-resume-fs` (real per-partition files, real
+cross-process durability) — the first genuinely cross-process execution-skip in this repo's
+history. `spark-resume-celeborn` still cannot serve this role: its `store`/`readPartition` are the
+same Tier 3 gap as `reattach`.
 
 ## 9. Module layout
 

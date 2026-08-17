@@ -23,6 +23,9 @@ class CountingExchangeStore(delegate: ExchangeStore) extends ExchangeStore {
     reattachCalls.incrementAndGet()
     delegate.reattach(handle)
   }
+  override def store(partitions: Array[Array[Byte]]): ExchangeHandle = delegate.store(partitions)
+  override def readPartition(handle: ExchangeHandle, partitionId: Int): Array[Byte] =
+    delegate.readPartition(handle, partitionId)
 }
 
 /** Delegates everything except `reattach`, which always throws `toThrow` -- for testing what
@@ -36,6 +39,9 @@ class ThrowingReattachStore(delegate: ExchangeStore, toThrow: => Throwable) exte
   override def checkIdentityIsolation(handle: ExchangeHandle): IsolationResult =
     delegate.checkIdentityIsolation(handle)
   override def reattach(handle: ExchangeHandle): ReattachResult = throw toThrow
+  override def store(partitions: Array[Array[Byte]]): ExchangeHandle = delegate.store(partitions)
+  override def readPartition(handle: ExchangeHandle, partitionId: Int): Array[Byte] =
+    delegate.readPartition(handle, partitionId)
 }
 
 class SafeReattachSpec extends AnyFunSuite with Matchers {

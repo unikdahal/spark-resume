@@ -20,16 +20,20 @@ import org.apache.spark.resume.api._
   * tell a whole-query anchor apart from a per-stage one except by re-deriving which fingerprint
   * space it came from, and giving each its own namespace makes that free instead of implicit.
   *
-  * NOT reattachable yet, and says so plainly rather than pretending otherwise: this phase has no
-  * `ExchangeStore`/backend wired to per-stage anchors, so `handleKind`/`handlePayload` are the
-  * disclosed sentinel [[StageCaptureListener.NoHandleKind]] / empty bytes -- this listener proves
-  * per-stage IDENTITY and STATISTICS only, not a live reattach path (see docs/DESIGN.md sec 14's
-  * Phase 2/3 split). `rowCount` is similarly not meaningful at stage granularity (a stage's own
-  * output row count is not among the runtime statistics this phase reads) and recorded as `0`. */
+  * @param exchangeStore Phase 4 addition, `None` by default -- when `None` (Phase 2's original,
+  *   unchanged behavior), `handleKind`/`handlePayload` are the disclosed sentinel
+  *   [[StageCaptureListener.NoHandleKind]] / empty bytes: proves per-stage IDENTITY and
+  *   STATISTICS only, no live reattach path, exactly as Phase 2 shipped. When `Some(store)`, this
+  *   listener ALSO reads each captured stage's REAL row bytes (via `CapturedStage.plan.execute()`
+  *   -- cheap, not a recomputation, see that field's own doc comment) and calls `store.store(...)`
+  *   to write a REAL, reattachable handle -- the producer-side half of real execution-skipping
+  *   (see `ExecutionSkipRule`). `rowCount` is real in this path too (counted from the actual rows
+  *   encoded), unlike the `None` path's `0` placeholder. */
 final class StageCaptureListener(
     queryId: String,
     anchorStore: AnchorStore,
-    providers: Seq[SourceFingerprint])
+    providers: Seq[SourceFingerprint],
+    exchangeStore: Option[ExchangeStore] = None)
     extends QueryExecutionListener {
 
   override def onSuccess(funcName: String, qe: QueryExecution, durationNs: Long): Unit = {
@@ -44,17 +48,33 @@ final class StageCaptureListener(
         // fences against each other.
         val generation = anchorStore.acquireGeneration(key)
         stages.foreach { s =>
+          val (handleKind, handlePayload, rowCount) = exchangeStore match {
+            case Some(store) =>
+              try {
+                val partitionBytes = captureRealPartitionBytes(s)
+                val handle = store.store(partitionBytes)
+                val realRowCount = countRows(partitionBytes)
+                (store.handleKind, store.serializeHandle(handle), realRowCount)
+              } catch {
+                // A-3 at THIS stage's granularity: a byte-capture failure for one stage must not
+                // block writing the other stages' anchors, and must not silently claim a real
+                // handle it doesn't have -- degrade to the same disclosed sentinel the `None` path
+                // uses, not a broken/partial real handle.
+                case NonFatal(_) => (StageCaptureListener.NoHandleKind, Array.emptyByteArray, 0L)
+              }
+            case None => (StageCaptureListener.NoHandleKind, Array.emptyByteArray, 0L)
+          }
           val anchor = Anchor(
             schemaVersion = "1",
             queryId = key,
             generation = generation,
             fingerprint = s.digest,
-            handleKind = StageCaptureListener.NoHandleKind,
-            handlePayload = Array.emptyByteArray,
+            handleKind = handleKind,
+            handlePayload = handlePayload,
             numMappers = s.numMappers,
             numPartitions = s.numPartitions,
             bytesByPartition = s.bytesByPartition,
-            rowCount = 0L,
+            rowCount = rowCount,
             createdAtMs = System.currentTimeMillis())
           anchorStore.putAnchor(generation, anchor)
         }
@@ -65,6 +85,26 @@ final class StageCaptureListener(
   }
 
   override def onFailure(funcName: String, qe: QueryExecution, exception: Exception): Unit = ()
+
+  /** Reads `stage.plan`'s ACTUAL materialized output, one real `Array[Byte]` per partition, via
+    * `RowBytesCodec.encode`. Runs a small job (`.mapPartitionsWithIndex(...).collect()`) against
+    * an ALREADY-materialized exchange -- cheap, re-reading already-computed shuffle output, not
+    * recomputing anything upstream (see `CapturedStage.plan`'s own doc comment). */
+  private def captureRealPartitionBytes(s: CapturedStage): Array[Array[Byte]] = {
+    val indexed = s.plan.execute().mapPartitionsWithIndex { (i, rows) =>
+      Iterator.single((i, RowBytesCodec.encode(rows)))
+    }.collect()
+    val out = new Array[Array[Byte]](s.numPartitions)
+    indexed.foreach { case (i, bytes) => out(i) = bytes }
+    // A partition Spark's own RDD produced zero tasks/output for (a genuinely empty partition,
+    // not a bug) still needs a real, present (if empty) entry -- readPartition's own contract
+    // forbids treating a missing entry as "no data" ambiguously.
+    for (i <- out.indices if out(i) == null) out(i) = Array.emptyByteArray
+    out
+  }
+
+  private def countRows(partitionBytes: Array[Array[Byte]]): Long =
+    partitionBytes.map(RowBytesCodec.countRows).sum
 }
 
 object StageCaptureListener {

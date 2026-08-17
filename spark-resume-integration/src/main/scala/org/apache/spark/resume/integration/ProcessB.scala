@@ -1,11 +1,15 @@
 package org.apache.spark.resume.integration
 
-import org.apache.spark.sql.SparkSession
+import java.util.concurrent.atomic.AtomicInteger
+
+import org.apache.spark.scheduler.{SparkListener, SparkListenerTaskEnd}
+import org.apache.spark.sql.{SparkSession, SparkSessionExtensions}
 
 import org.apache.spark.resume.celeborn.CelebornExchangeStore
 import org.apache.spark.resume.core._
+import org.apache.spark.resume.fs.FsExchangeStore
 import org.apache.spark.resume.redis.RedisAnchorStore
-import org.apache.spark.resume.spark35.{StageAdmissionCheck, StageCaptureListener}
+import org.apache.spark.resume.spark35.{ExecutionSkipRule, StageAdmissionCheck, StageCaptureListener}
 
 /** The "resuming" side of this module's cross-process, cross-backend composition proof (see
   * README.md and [[ProcessA]]'s doc comment for the producing side). A separate JVM and a fresh
@@ -42,6 +46,94 @@ object ProcessB {
   def main(args: Array[String]): Unit = {
     val queryId = requireEnv("INTEGRATION_QUERY_ID")
     val scenario = sys.env.getOrElse("INTEGRATION_SCENARIO", "admitted")
+
+    if (scenario == "skip") {
+      runSkipScenario(queryId)
+    } else {
+      runCelebornBackedScenario(queryId, scenario)
+    }
+  }
+
+  private def countTasks(spark: SparkSession)(body: => Unit): Int = {
+    val counter = new AtomicInteger(0)
+    val listener = new SparkListener {
+      override def onTaskEnd(taskEnd: SparkListenerTaskEnd): Unit = counter.incrementAndGet()
+    }
+    spark.sparkContext.addSparkListener(listener)
+    try {
+      body
+      spark.sparkContext.listenerBus.waitUntilEmpty(30000)
+    } finally {
+      spark.sparkContext.removeSparkListener(listener)
+    }
+    counter.get()
+  }
+
+  /** `scenario=skip`: the REAL cross-process execution-skip proof this whole module exists to
+    * provide -- `ProcessA` (a SEPARATE, ALREADY-EXITED process) wrote the anchor and the real row
+    * bytes through `spark-resume-fs`, on disk; this process reads them back from a fresh
+    * `SparkSession` with `ExecutionSkipRule` registered via `injectQueryStagePrepRule`, exactly
+    * the mechanism `AqeExecutionSkipSpikeSpec`/`ExecutionSkipAcceptanceSpec`
+    * (`spark-resume-spark-3.5`) proved works, now proven to survive an actual OS process boundary
+    * too. Same acceptance criteria as `ExecutionSkipAcceptanceSpec`: correct final rows AND fewer
+    * Spark tasks than an unresumed baseline -- both, not either. */
+  private def runSkipScenario(queryId: String): Unit = {
+    val redisHost = sys.env.getOrElse("REDIS_HOST", "localhost")
+    val redisPort = sys.env.getOrElse("REDIS_PORT", "6379").toInt
+    val fsBaseDir = requireEnv("FS_STORE_BASE_DIR")
+
+    val redisStore = new RedisAnchorStore(redisHost, redisPort)
+    val exchangeStore = new FsExchangeStore(fsBaseDir)
+    try {
+      val anchorsBeforeResume = redisStore.loadAnchors(StageCaptureListener.stageQueryId(queryId))
+      require(anchorsBeforeResume.nonEmpty,
+        "no anchors found -- ProcessA (scenario=skip) must run first and write them")
+
+      // -- Baseline: an ordinary session, no skip rule -- ground truth for correct rows AND the
+      // real task count an unresumed run of the IDENTICAL query actually needs. --
+      var baselineRows: Array[Long] = Array.empty
+      var baselineTaskCount = 0
+      val baselineSpark = SparkSession.builder().master("local[2]").appName("skip-b-baseline").getOrCreate()
+      try {
+        baselineTaskCount = countTasks(baselineSpark) {
+          baselineRows = Fixture.query(baselineSpark).collect().map(_.getLong(0)).sorted
+        }
+      } finally {
+        baselineSpark.stop()
+      }
+
+      // -- Resuming session: ExecutionSkipRule registered BEFORE the session is built, reading
+      // real bytes from the real, cross-process-durable fs store ProcessA wrote to. --
+      var resumedRows: Array[Long] = Array.empty
+      var resumedTaskCount = 0
+      val resumingSpark = SparkSession.builder()
+        .master("local[2]")
+        .appName("skip-b-resuming")
+        .withExtensions((ext: SparkSessionExtensions) => ext.injectQueryStagePrepRule { _ =>
+          new ExecutionSkipRule(queryId, redisStore, exchangeStore, () => new FsExchangeStore(fsBaseDir), Seq.empty)
+        })
+        .getOrCreate()
+      try {
+        resumedTaskCount = countTasks(resumingSpark) {
+          resumedRows = Fixture.query(resumingSpark).collect().map(_.getLong(0)).sorted
+        }
+      } finally {
+        resumingSpark.stop()
+      }
+
+      println(s"[ProcessB] scenario=skip: baselineTaskCount=$baselineTaskCount resumedTaskCount=$resumedTaskCount")
+      require(resumedRows.toSeq == baselineRows.toSeq,
+        s"resumed rows do not match baseline -- resumed=${resumedRows.take(5).toSeq}..., baseline=${baselineRows.take(5).toSeq}...")
+      require(resumedTaskCount < baselineTaskCount,
+        s"expected FEWER tasks when resuming (the stage should be genuinely skipped), got resumed=$resumedTaskCount baseline=$baselineTaskCount")
+      println("[ProcessB] SUCCESS (skip): real execution-skip proven across a real OS process boundary -- " +
+        "correct results, fewer tasks, real bytes read from spark-resume-fs")
+    } finally {
+      redisStore.close()
+    }
+  }
+
+  private def runCelebornBackedScenario(queryId: String, scenario: String): Unit = {
     val redisHost = sys.env.getOrElse("REDIS_HOST", "localhost")
     val redisPort = sys.env.getOrElse("REDIS_PORT", "6379").toInt
     val celebornRestBaseUrl = sys.env.getOrElse("CELEBORN_MASTER_REST", "http://localhost:9098")

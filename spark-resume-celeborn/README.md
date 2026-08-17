@@ -13,16 +13,21 @@ required to pass — 8 tests). `isFresh` queries the master's own admin REST API
 (`ShuffleApi.getShuffles()`) live, not a cache; `checkIdentityIsolation` is a real, enforced check
 against this project's own disclosed hazard (see below).
 
-**`reattach` is not implemented.** It throws `UnsupportedOperationException` naming the exact gap.
-This is `docs/DESIGN.md` §8's Tier 3 exactly as specified: *"a documented backend-patch
-requirement... a property of the shuffle service, not of Spark."* Verified by checking vanilla
-Celeborn `0.7.0`'s actual public client API (`ShuffleClient`, `LifecycleManager`), not assumed:
-`readPartition`/`registerMapPartitionTask` are scoped to the `LifecycleManager` that registered the
-shuffle. There is no public method anywhere in the client API to read a shuffle's committed
-partition locations under a *different* application's identity. `spark-resume-core`'s
-`SafeReattach.attempt` converts that exception into a structured `RefusedUnsupported` outcome, so
-a caller doing everything right gets a refusal, not a raw throw — proven end to end against this
-real store in `SafeReattachIntegrationSpec`, not just documented.
+**`reattach`, `store`, and `readPartition` are not implemented.** All three throw
+`UnsupportedOperationException` naming the exact gap. This is `docs/DESIGN.md` §8's Tier 3 exactly
+as specified: *"a documented backend-patch requirement... a property of the shuffle service, not
+of Spark."* Verified by checking vanilla Celeborn `0.7.0`'s actual public client API
+(`ShuffleClient`, `LifecycleManager`), not assumed: `readPartition`/`registerMapPartitionTask` are
+scoped to the `LifecycleManager` that registered the shuffle. There is no public method anywhere in
+the client API to read (or write, under a foreign identity) a shuffle's committed partition
+locations under a *different* application's identity. `spark-resume-core`'s `SafeReattach.attempt`
+converts the `reattach` exception into a structured `RefusedUnsupported` outcome, so a caller doing
+everything right gets a refusal, not a raw throw — proven end to end against this real store in
+`SafeReattachIntegrationSpec`, not just documented. `store`/`readPartition` (Phase 4, added
+alongside `spark-resume-fs`'s real execution-skip proof) are the SAME gap, not a new one — see
+`docs/COMPATIBILITY.md`'s "Real execution-skipping" section: this store cannot back real
+execution-skipping at all, which is exactly why `spark-resume-fs` exists as this repo's proof
+target instead.
 
 ## A real safety check, not just a disclosed hazard
 

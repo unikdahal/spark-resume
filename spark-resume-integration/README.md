@@ -1,11 +1,11 @@
 # spark-resume-integration
 
 The cross-process, cross-backend composition proof no other module in this repo provides: every
-module up to this point (`spark-resume-spark-3.5`, `spark-resume-redis`, `spark-resume-celeborn`)
-is proven only in isolation against its own real backend. Nothing else proves the SPI actually
-composes: a real Spark capture writing a real anchor to a real Redis, a second, separate driver
-process reading it back, running it through the real `AdmissionEngine`, and calling
-`SafeReattach.attempt` against a real Celeborn cluster.
+module up to this point is proven only in isolation against its own real backend. Nothing else
+proves the SPI actually composes: a real Spark capture writing a real anchor to a real Redis, a
+second, separate driver process reading it back, running it through the real `AdmissionEngine`,
+and either reattaching for real (`skip` scenario, against `spark-resume-fs`) or being refused by
+the documented Tier 3 gap (every other scenario, against `spark-resume-celeborn`).
 
 Not a library. This module is never depended on by anything else and publishes no test-jar; it
 exists solely to run `ProcessA`/`ProcessB` against real infrastructure.
@@ -15,11 +15,30 @@ exists solely to run `ProcessA`/`ProcessB` against real infrastructure.
 Two SEPARATE JVM processes, each its own `mvn test -Dsuites=...` invocation (not two specs sharing
 one JVM — see `ProcessASpec`/`ProcessBSpec`'s doc comments for why that split is load-bearing, not
 incidental: a single JVM proves nothing about cross-process durability, which is the whole reason
-this project exists), run through FOUR real scenarios (`INTEGRATION_SCENARIO`, see `ProcessB`'s
+this project exists), run through FIVE real scenarios (`INTEGRATION_SCENARIO`, see `ProcessB`'s
 doc comment for the full table): `admitted` → `RefusedUnsupported`, `stale` → `RefusedStale`,
-`isolation-conflict` → `RefusedIsolationConflict`, and `miss` → every decision `RejectedBy` (no
-`SafeReattach` call at all). Every terminal state this pipeline can honestly reach today, proven
-against real backends, not just the one happy path.
+`isolation-conflict` → `RefusedIsolationConflict`, `miss` → every decision `RejectedBy` (no
+`SafeReattach` call at all), and **`skip` → a REAL execution skip**: correct final rows AND
+genuinely fewer Spark tasks than an unresumed baseline, real bytes written by `ProcessA` and read
+back by `ProcessB` through `spark-resume-fs`. Every terminal state this pipeline can honestly reach
+today, proven against real backends, not just the one happy path.
+
+## The `skip` scenario — real execution-skipping, across a real process boundary
+
+`ProcessA` uses the REAL `StageCaptureListener` (registered as an actual listener, not the manual
+anchor-building the Celeborn-backed scenarios below use to fabricate a handle) with its
+`exchangeStore` parameter set to a real `FsExchangeStore` — capturing the query's ACTUAL row bytes
+and writing a real, reattachable anchor, then exiting. `ProcessB`, a separate JVM, builds a fresh
+`SparkSession` with `ExecutionSkipRule` registered via `injectQueryStagePrepRule` BEFORE the
+session exists, runs the IDENTICAL query, and asserts both: the resulting rows match an unresumed
+baseline run within the same process, AND the resumed run submits strictly fewer Spark tasks —
+observed at exactly the numbers `spark-resume-spark-3.5`'s own `ExecutionSkipAcceptanceSpec`
+found in-process (7 baseline, 3 resumed), now reproduced across two real OS processes with real
+files on disk as the durability layer, not `InMemoryExchangeStore`. See
+`spark-resume-spark-3.5/README.md` for the full mechanism (`RowBytesCodec`/`ExecutionSkipRule`/
+`SkippedShuffleRDD`) this scenario exercises end to end.
+
+## The other four scenarios — the documented Tier 3 refusal, proven the same way
 
 - **`ProcessA` (the producing side).** A real local `SparkSession` runs a real shuffle query
   (`Fixture.query`, a plain `repartition` — the simplest shape guaranteed to produce exactly one
@@ -47,20 +66,19 @@ pipeline is stronger evidence than three modules each passing alone: it proves e
 backend byte-read composes correctly across real processes, and that the one thing that doesn't
 work is exactly, and only, the already-disclosed gap — not a silent success, and not a raw crash.
 
-**No execution is skipped anywhere in this repository, still.** This module does not resume a
-query; it proves the decision-and-refusal path composes end to end.
-
-## The seam this module had to bridge, and why it isn't in spark-resume-spark-3.5
-
-`ExchangeStore` has no producer-side "issue me a handle" method — every method on that trait is a
-resuming-driver operation (see `ExchangeStore.scala`). `StageCaptureListener` (Phase 2, committed,
-already proven) is therefore correct to always write the `NoHandleKind` sentinel: it genuinely has
-no way to know what Celeborn shuffle id a given Spark shuffle stage maps to. `ProcessA`
-deliberately does NOT reuse `StageCaptureListener`; it builds the real `CelebornHandle` itself,
-exactly the way an operator manually wiring these two systems together today would have to. Closing
-this gap for real — either a producer-side method on the SPI, or wiring `spark-resume-spark-3.5` to
-a specific shuffle manager's internal id scheme — is a real design decision for a future phase, not
-this one. See `ProcessA`'s doc comment for the full account.
+For `admitted`/`stale`/`isolation-conflict`/`miss`: `ExchangeStore` has no producer-side "issue me
+a handle" method for Celeborn's use case (real Celeborn shuffle ids need to be wired to a specific
+shuffle manager's internal id scheme, not just `store`/`readPartition`'s opaque bytes) — every
+Celeborn-facing method on that trait is a resuming-driver operation (see `ExchangeStore.scala`).
+`ProcessA` builds the real `CelebornHandle` itself for these scenarios, exactly the way an operator
+manually wiring these two systems together today would have to. The terminal outcome for
+`admitted` is `RefusedUnsupported`, and `ProcessB` asserts exactly that: real cross-process
+fingerprint match, real cross-process anchor load, a real `Admitted` decision, and
+`SafeReattach.attempt` reaching all the way to the real Celeborn cluster before being refused by
+the one documented, checked Tier 3 gap (`CelebornExchangeStore.reattach` — see
+`spark-resume-celeborn/README.md`). Stronger evidence than three modules each passing alone: it
+proves everything up to the backend byte-read composes correctly across real processes, and that
+the one thing that doesn't work is exactly, and only, the already-disclosed gap.
 
 ## Running it — needs a real Redis and a real Celeborn cluster already up
 
@@ -71,8 +89,10 @@ REDIS_HOST=localhost REDIS_PORT=16379 ./run-integration-test.sh
 Does NOT stand up either backend itself (unlike `spark-resume-celeborn/run-celeborn-tests.sh`):
 both are already-proven, already-documented infrastructure this module composes against, not a
 third variant of the same clusters to maintain. Fails loudly, before running anything, if either
-is unreachable. Runs all four scenarios in sequence, each its own fresh `INTEGRATION_QUERY_ID` and
-its own ProcessA/ProcessB pair. Reproduced clean across repeated consecutive runs.
+is unreachable. Runs all five scenarios in sequence, each its own fresh `INTEGRATION_QUERY_ID` and
+its own ProcessA/ProcessB pair (`skip` additionally gets its own fresh `FS_STORE_BASE_DIR`, a real
+temp directory, so repeated runs never collide). Reproduced clean across repeated consecutive
+runs — 3x back-to-back after the `skip` scenario was added, zero flakes.
 
 ## A real bug this module's own testing found, in `spark-resume-spark-3.5`
 

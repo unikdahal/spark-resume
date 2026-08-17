@@ -12,7 +12,8 @@ final case class InMemoryHandle(id: String) extends ExchangeHandle
 private final case class Record(
     result: ReattachResult,
     var superseded: Boolean,
-    var identityConflict: Boolean)
+    var identityConflict: Boolean,
+    partitions: Option[Array[Array[Byte]]] = None)
 
 /** A reference [[ExchangeStore]] implementation backed by an in-process map. NOT a production
   * store -- it has no persistence and no cross-process visibility, which makes it useless for
@@ -20,8 +21,18 @@ private final case class Record(
   * for two purposes: (1) a zero-infrastructure way to try the admission engine locally, and (2)
   * the first, reference implementation the testkit contracts in
   * `org.apache.spark.resume.api.testkit` are proven against -- see
-  * `org.apache.spark.resume.api.testkit.ExchangeStoreContract`. */
-final class InMemoryExchangeStore extends ExchangeStore {
+  * `org.apache.spark.resume.api.testkit.ExchangeStoreContract`.
+  *
+  * Extends `java.io.Serializable` (Phase 4) -- NOT true of `ExchangeStore` implementations in
+  * general (a real backend's store is meant to be reconstructed per-executor from a small config
+  * closure, e.g. `spark-resume-fs`'s `() => new FsExchangeStore(baseDir)`, never shipped as a
+  * live instance -- see `ExecutionSkipRule`'s `storeFactory` doc comment). This class is the one
+  * legitimate exception: its whole state IS a plain `ConcurrentHashMap` over serializable content
+  * (no open connections, no backend-internal wire state), so Java-serializing it is
+  * content-preserving, not a workaround -- letting a same-JVM test (`local[]` mode still
+  * round-trips task closures through real serialization, by design, for parity with cluster mode)
+  * exercise a real execution-skip RDD without needing an actual multi-process backend. */
+final class InMemoryExchangeStore extends ExchangeStore with Serializable {
   private val records = new ConcurrentHashMap[String, Record]()
 
   override def handleKind: String = "in-memory"
@@ -84,6 +95,36 @@ final class InMemoryExchangeStore extends ExchangeStore {
     case h: InMemoryHandle =>
       Option(records.get(h.id)).map(_.result)
         .getOrElse(throw new NoSuchElementException(s"no record for handle ${h.id}"))
+    case other => throw new IllegalArgumentException(s"not an InMemoryHandle: $other")
+  }
+
+  override def store(partitions: Array[Array[Byte]]): ExchangeHandle = {
+    val id = java.util.UUID.randomUUID().toString
+    // A synthesized ReattachResult, not real producer-supplied statistics -- this is the
+    // reference/dev-only store, whose whole point is being usable with zero setup; a caller
+    // needing REAL statistics from a REAL production run should be using a real backend
+    // (spark-resume-fs, spark-resume-celeborn), not this one. numMappers=1 / a single all-zero
+    // mapperAttempts entry per partition is a documented simplification for this store alone.
+    val result = ReattachResult(
+      numMappers = 1,
+      numPartitions = partitions.length,
+      bytesByPartition = partitions.map(_.length.toLong),
+      rowCount = 0L,
+      mapperAttempts = Array(0))
+    records.put(id, Record(result, superseded = false, identityConflict = false, partitions = Some(partitions)))
+    InMemoryHandle(id)
+  }
+
+  override def readPartition(handle: ExchangeHandle, partitionId: Int): Array[Byte] = handle match {
+    case h: InMemoryHandle =>
+      val record = Option(records.get(h.id))
+        .getOrElse(throw new NoSuchElementException(s"no record for handle ${h.id}"))
+      val parts = record.partitions.getOrElse(
+        throw new NoSuchElementException(s"handle ${h.id} was registered via put(), not store() -- no partition bytes to read"))
+      if (partitionId < 0 || partitionId >= parts.length) {
+        throw new IndexOutOfBoundsException(s"partitionId=$partitionId out of range [0, ${parts.length})")
+      }
+      parts(partitionId)
     case other => throw new IllegalArgumentException(s"not an InMemoryHandle: $other")
   }
 }

@@ -8,6 +8,7 @@ import org.apache.spark.sql.SparkSession
 
 import org.apache.spark.resume.api._
 import org.apache.spark.resume.celeborn.{CelebornExchangeStore, CelebornHandle}
+import org.apache.spark.resume.fs.FsExchangeStore
 import org.apache.spark.resume.redis.RedisAnchorStore
 import org.apache.spark.resume.spark35.{StageCaptureListener, StageFingerprint}
 
@@ -43,6 +44,53 @@ object ProcessA {
   def main(args: Array[String]): Unit = {
     val queryId = requireEnv("INTEGRATION_QUERY_ID")
     val scenario = sys.env.getOrElse("INTEGRATION_SCENARIO", "admitted")
+
+    if (scenario == "skip") {
+      runSkipScenario(queryId)
+    } else {
+      runCelebornBackedScenario(queryId, scenario)
+    }
+  }
+
+  /** `scenario=skip`: the REAL producer-side capture path (`StageCaptureListener` itself,
+    * registered as an actual listener -- not the manual anchor-building every other scenario in
+    * this object does to fabricate a Celeborn handle), writing REAL row bytes through a real,
+    * cross-process-durable `spark-resume-fs` store. This is the genuine cross-process proof
+    * `ExecutionSkipAcceptanceSpec` (`spark-resume-spark-3.5`) cannot provide on its own: that
+    * test uses `InMemoryExchangeStore`, real but explicitly NOT cross-process-durable (see its
+    * own doc comment) -- this scenario proves the SAME mechanism survives an actual OS process
+    * boundary, backed by real files on disk. See [[ProcessB]]'s doc comment for the resuming
+    * side and the acceptance criteria. */
+  private def runSkipScenario(queryId: String): Unit = {
+    val redisHost = sys.env.getOrElse("REDIS_HOST", "localhost")
+    val redisPort = sys.env.getOrElse("REDIS_PORT", "6379").toInt
+    val fsBaseDir = requireEnv("FS_STORE_BASE_DIR")
+
+    val redisStore = new RedisAnchorStore(redisHost, redisPort)
+    val exchangeStore = new FsExchangeStore(fsBaseDir)
+    val spark = SparkSession.builder()
+      .master("local[2]")
+      .appName("spark-resume-integration-process-a-skip")
+      .getOrCreate()
+    try {
+      val listener = new StageCaptureListener(queryId, redisStore, Seq.empty, exchangeStore = Some(exchangeStore))
+      spark.listenerManager.register(listener)
+      Fixture.query(spark).collect()
+      spark.sparkContext.listenerBus.waitUntilEmpty(30000)
+
+      val anchors = redisStore.loadAnchors(StageCaptureListener.stageQueryId(queryId))
+      require(anchors.nonEmpty, "StageCaptureListener wrote no anchors -- fixture bug, not a real finding")
+      require(anchors.forall(_.handleKind == exchangeStore.handleKind),
+        s"expected every anchor to carry a REAL fs handle, got handleKinds: ${anchors.map(_.handleKind)}")
+      println(s"[ProcessA] scenario=skip: captured ${anchors.size} real anchor(s) with REAL row bytes " +
+        s"via StageCaptureListener, stored under $fsBaseDir")
+    } finally {
+      redisStore.close()
+      spark.stop()
+    }
+  }
+
+  private def runCelebornBackedScenario(queryId: String, scenario: String): Unit = {
     val redisHost = sys.env.getOrElse("REDIS_HOST", "localhost")
     val redisPort = sys.env.getOrElse("REDIS_PORT", "6379").toInt
     val celebornRestBaseUrl = sys.env.getOrElse("CELEBORN_MASTER_REST", "http://localhost:9098")

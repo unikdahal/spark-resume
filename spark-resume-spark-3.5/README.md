@@ -12,7 +12,8 @@ scope.
 admission decision — `Admitted` for the identical query, `Rejected` for a structurally different
 one, and (the go/no-go case) `Rejected` when the underlying file was mutated between capture and
 check, not silently admitted. `StageAdmissionCheckIntegrationSpec` proves the same claim at
-per-stage granularity (see below). 72 tests across the whole repo, `mvn clean install`, reproduced
+per-stage granularity (see below). See the repo root README for the current whole-repo test count
+(it has grown substantially since this module was first built) — `mvn clean install`, reproduced
 clean across multiple consecutive full runs (see the async-listener-bus bug below for why rerun
 count mattered here).
 
@@ -57,25 +58,43 @@ real, reproduced collision, forced via `spark.sql.exchange.reuse=false` so Spark
 (`StageAdmissionCheckIntegrationSpec`), though which store implementation keeps one or both
 same-digest anchors turned out to be implementation-specific (see `docs/DESIGN.md` §14).
 
-## What this does NOT prove
+## Real execution-skipping (`RowBytesCodec` / `ExecutionSkipRule` / `SkippedShuffleRDD`)
 
-**No execution is ever skipped, still — but this is now an unbuilt feature, not a blocked one.**
-A prior version of this README said there was no public Spark 3.5 extension point that could let a
-library intercept an individual stage's execution and substitute previously-computed output. That
-was checked again in Phase 4 and found wrong: `SparkSessionExtensions.injectQueryStagePrepRule`
-(public since Spark 3.0) runs on the whole plan BEFORE any `Exchange` materializes, and a disclosed
-spike (`AqeExecutionSkipSpikeSpec`, committed, not production code) proved a leaf substitute for an
-`Exchange` survives Spark's own validation and produces correct downstream results — see
-`docs/DESIGN.md` §8's correction. What this module proves TODAY is still only the *decision*
-layer: given a real plan, would admission fire, and why. Turning an `Admitted` decision into an
-actual skipped stage now needs real backend-read-path engineering (a backend-aware `RDD` inside
-`doExecute()`, not the spike's eager-execute cheat), not a missing Spark API.
+**Execution IS actually skipped now, for real, not just decided on paper** — the single biggest
+change this README has ever needed. A prior version said no public Spark 3.5 extension point could
+let a library intercept an individual stage's execution and substitute previously-computed output.
+Checked again in Phase 4 and found wrong: `SparkSessionExtensions.injectQueryStagePrepRule`
+(public since Spark 3.0) runs on the whole plan BEFORE any `Exchange` materializes — a disclosed
+spike (`AqeExecutionSkipSpikeSpec`) proved a leaf substitute for an `Exchange` survives Spark's own
+validation and produces correct downstream results, and `ExecutionSkipRule` is the REAL,
+non-spike version: it makes the identical admission decision `StageAdmissionCheck` would (same
+digest, same `AdmissionEngine` call), and when admitted through a reattachable handle, substitutes
+`SkippedExchangeExec` — a leaf whose `doExecute()` returns a `SkippedShuffleRDD` that reads REAL
+bytes per partition, ON THE EXECUTOR that will consume them, via `ExchangeStore.readPartition`.
+No shuffle bytes are funneled through the driver; each partition's `compute()` runs independently.
 
-**Capture statistics are honest placeholders, not real measurements.** `SparkResumeListener`
-fires from `QueryExecutionListener.onSuccess`, after the whole query has already finished, with
-no hook into any individual stage's materialization moment. `numMappers`/`bytesByPartition` in
-the anchors it writes are disclosed placeholders (`1` and all-zero respectively); `numPartitions`
-and `rowCount` are the two facts genuinely readable from public post-execution state.
+`RowBytesCodec` is what makes the bytes real: Spark's own `UnsafeRow` binary format, length-prefixed
+per row — the same shape Spark's shuffle write path uses internally — encoded by
+`StageCaptureListener`'s new `exchangeStore` parameter (reading a captured stage's ACTUAL
+materialized output via `stage.plan.execute()`, cheap since it re-reads already-computed shuffle
+output, not a recomputation) and decoded the same way inside `SkippedShuffleRDD.compute()`.
+
+`ExecutionSkipAcceptanceSpec` is the acceptance test, and it checks BOTH things a correct-results-
+only test could pass on even if the substitution silently fell through to normal execution:
+correct final rows AND fewer Spark tasks than an unresumed baseline. Observed for the fixture
+query (`range(4 partitions).repartition(3).collect()`): baseline 7 tasks (4 upstream shuffle-map +
+3 result), resumed 3 (only the result tasks, each reading its own partition) — the 4 upstream map
+tasks are genuinely ELIMINATED. Uses `InMemoryExchangeStore` (made `Serializable` for exactly this
+reason — its state is a plain, content-preserving `ConcurrentHashMap`, unlike a real backend's
+store, which is never shipped live; see `ExecutionSkipRule`'s `storeFactory` doc comment), so this
+module stays backend-agnostic; `spark-resume-integration`'s `skip` scenario proves the identical
+mechanism survives a real cross-process boundary against `spark-resume-fs`.
+
+**Capture statistics are honest placeholders when no real store is wired, real when one is.**
+`SparkResumeListener` (whole-query) still has no per-stage hook and still writes disclosed
+placeholders. `StageCaptureListener`'s ORIGINAL `None`-default `exchangeStore` behavior is
+UNCHANGED (`NoHandleKind` sentinel, `rowCount=0`) — passing `Some(store)` is what turns on the new,
+real capture path (real handle, real `rowCount` counted from actual encoded rows).
 
 ## Three real bugs found building and testing this, none anticipated by design
 

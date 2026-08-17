@@ -9,17 +9,17 @@ have a note, it means "not attempted," not "known to work."
 
 | Spark version | Status | Notes |
 |---|---|---|
-| 3.5.9 | **Tested** | The only Spark line this project targets today. `spark-resume-spark-3.5`'s whole suite (30 tests as of this doc) runs against it in `mvn install`. |
+| 3.5.9 | **Tested** | The only Spark line this project targets today. `spark-resume-spark-3.5`'s whole suite (31 tests as of this doc, including a real execution-skip acceptance test) runs against it in `mvn install`. |
 | 3.0 – 3.4 | Not tested | `injectQueryStagePrepRule`/`injectQueryStageOptimizerRule` (docs/DESIGN.md §8's correction) are documented as present since Spark 3.0, but nothing in this repo has been run against any version other than 3.5.9. `WholePlanFingerprint`'s AQE-unwrap logic (`AdaptiveSparkPlanExec.initialPlan`, `QueryStageExec`) is specific to internals that may differ across minor lines — do not assume compatibility without testing. |
 | 4.x | Not tested | See `spark-resume-spark-3.5/pom.xml`'s `provided`-scope Spark dependency — this module compiles against 3.5's API surface specifically; a 4.x-targeting module would need its own `spark-resume-spark-4.x` module (see `docs/DESIGN.md` §9: "One module per supported Spark line going forward, never a single module straddling incompatible internal APIs across lines"). |
 
 ## `ExchangeStore` implementations
 
-| Backend | Module | `handleKind`/`isFresh`/`checkIdentityIsolation` | `reattach` | Tested against |
-|---|---|---|---|---|
-| In-memory | `spark-resume-api` (`InMemoryExchangeStore`) | Real | Real | The reference implementation the conformance testkit was originally written against. Dev/test only — no cross-process durability. |
-| Apache Celeborn 0.7.0 | `spark-resume-celeborn` | Real, against a real cluster | **Not implemented** — documented `UnsupportedOperationException`, a checked Tier 3 backend capability gap (vanilla Celeborn's public client API has no cross-application shuffle read; confirmed via bytecode inspection, not assumed) | `CelebornExchangeStoreSpec` (`ExchangeStoreContract`, `reattachSupported = false`) against a real single-master/single-worker cluster stood up from the official binary release (`run-celeborn-tests.sh`). |
-| Local filesystem | `spark-resume-fs` | Real | **Real** — the only backend in this repo where `reattach` actually succeeds; reads real files back off disk. Built specifically to prove the conformance testkit itself, not as a production backend. | `FsExchangeStoreSpec` (`ExchangeStoreContract`, `reattachSupported = true`, the default), `FsHandleCodecSpec`, `FsExchangeStoreDirectSpec` — all against a real local temp directory, zero external infrastructure. |
+| Backend | Module | `handleKind`/`isFresh`/`checkIdentityIsolation` | `reattach` / `store` / `readPartition` | Real execution-skip capable? | Tested against |
+|---|---|---|---|---|---|
+| In-memory | `spark-resume-api` (`InMemoryExchangeStore`) | Real | Real | Yes, same-process only — `Serializable` (Phase 4) specifically to drive `spark-resume-spark-3.5`'s `ExecutionSkipAcceptanceSpec` | The reference implementation the conformance testkit was originally written against. Dev/test only — no cross-process durability. |
+| Apache Celeborn 0.7.0 | `spark-resume-celeborn` | Real, against a real cluster | **Not implemented, all three** — documented `UnsupportedOperationException`, a checked Tier 3 backend capability gap (vanilla Celeborn's public client API has no cross-application shuffle read/write; confirmed via bytecode inspection, not assumed) | **No** — same Tier 3 gap | `CelebornExchangeStoreSpec` (`ExchangeStoreContract`, `reattachSupported = false`) against a real single-master/single-worker cluster stood up from the official binary release (`run-celeborn-tests.sh`). |
+| Local filesystem | `spark-resume-fs` | Real | **Real, all three** — reads/writes real, per-partition-addressable files off disk | **Yes, cross-process** — this repo's real proof target, since Celeborn's gap rules it out | `FsExchangeStoreSpec` (`ExchangeStoreContract`, `reattachSupported = true`, the default), `FsHandleCodecSpec`, `FsExchangeStoreDirectSpec` — all against a real local temp directory, zero external infrastructure. Also: `spark-resume-integration`'s `skip` scenario, real cross-process execution-skip. |
 
 ## `AnchorStore` implementations
 
@@ -39,3 +39,14 @@ have a note, it means "not attempted," not "known to work."
 
 Every real implementation above extends the matching testkit and passes 100% of it — see
 `CONTRIBUTING.md` for why this is a hard gate, not a suggestion, for any new implementation.
+
+## Real execution-skipping
+
+| Component | Module | Status |
+|---|---|---|
+| `RowBytesCodec` | `spark-resume-spark-3.5` | Real — Spark's own `UnsafeRow` binary format, length-prefixed per row. |
+| `ExecutionSkipRule` / `SkippedShuffleRDD` / `SkippedExchangeExec` | `spark-resume-spark-3.5` | Real — registered via `SparkSessionExtensions.injectQueryStagePrepRule` (public since Spark 3.0). Substitutes a real byte-reading leaf for an admitted, reattachable `Exchange`; falls through to normal execution on any precondition failure. |
+| `StageCaptureListener`'s `exchangeStore` parameter | `spark-resume-spark-3.5` | Real when `Some(store)` — captures actual materialized row bytes and calls `store.store(...)`. `None` (default) preserves Phase 2's original stats-only, sentinel-handle behavior unchanged. |
+| Acceptance proof, same process | `spark-resume-spark-3.5` (`ExecutionSkipAcceptanceSpec`) | Real, against `InMemoryExchangeStore` — correct final rows AND strictly fewer Spark tasks than an unresumed baseline (observed 7 → 3 for the fixture query). |
+| Acceptance proof, real cross-process | `spark-resume-integration` (`skip` scenario) | Real, against `spark-resume-fs` — identical acceptance criteria, proven across two separate OS processes with real files on disk as the durability layer. |
+| Same capability against Celeborn | — | **Not possible** — `CelebornExchangeStore.store`/`readPartition` are the same Tier 3 `UnsupportedOperationException` as `reattach`. |
