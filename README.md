@@ -19,11 +19,13 @@ what this project explicitly does *not* attempt to solve.
 
 ## Status
 
-**Phase 0 done, Phase 1 done.** `spark-resume-api` (the SPI) + `spark-resume-core` (the admission
-engine, the identity-isolation-safe reattach path) + `spark-resume-spark-3.5` (Tier 1 Spark 3.5
-integration: real-plan fingerprinting + a real capture/check decision-layer proof against two
-independent `SparkSession`s) all build and are tested — 41/41 tests, `mvn clean install`,
-reproduced clean across 5 consecutive full runs. **Still no execution-skip mechanism anywhere in
+**Phase 0 done, Phase 1 done, Phase 2 in progress (per-stage fingerprinting done; Iceberg
+provider and Redis anchor store not yet built).** `spark-resume-api` (the SPI) +
+`spark-resume-core` (the admission engine, the identity-isolation-safe reattach path) +
+`spark-resume-spark-3.5` (Tier 1 Spark 3.5 integration: real whole-plan AND per-stage
+fingerprinting, a capture/check decision-layer proof against two independent `SparkSession`s at
+both granularities) all build and are tested — 48/48 tests, `mvn clean install`, reproduced clean
+across multiple consecutive full runs. **Still no execution-skip mechanism anywhere in
 this repository** — Tier 1 has no public Spark extension point to substitute a stage's previously-
 computed output for real execution; that needs Tier 2/3 (Phase 2+), which do not exist yet. Read
 `spark-resume-spark-3.5/README.md`'s "What this does NOT prove" section before assuming more than

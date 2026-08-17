@@ -487,15 +487,34 @@ metrics system (a `Source` registered the standard way), not a bespoke reporting
    full-suite runs) — see `spark-resume-spark-3.5/README.md` for the full account of each.
 3. **Phase 2 — Tier 2 extension point (or its Tier-1-only degradation), per-stage fingerprinting,
    Iceberg fingerprint provider, Redis anchor store.** This is the phase that reaches parity with
-   what the prototypes already proved, built cleanly and generically instead of ad hoc. Carries
-   forward a consequence of Phase 1's `initialPlan` fix (bug fixed, but the shape mismatch it
-   trades away is not): a capture's anchor records `numPartitions`/statistics from the
-   post-execution plan while its fingerprint identity is keyed off the pre-adaptive `initialPlan`
-   shape, so a run where AQE coalesced partitions or split a skew join writes an anchor whose
-   identity cannot see the adaptation that produced its own numbers. Harmless at Phase 1 (nothing
-   consumes those numbers yet), but per-stage fingerprinting/adoption in this phase MUST reconcile
-   `initialPlan`-based identity with the runtime-adapted stage shape before trusting a match — this
-   is exactly the false-positive-resumption surface A-1 exists to guard.
+   what the prototypes already proved, built cleanly and generically instead of ad hoc.
+   - **Per-stage fingerprinting — DONE, in `spark-resume-spark-3.5`
+     (`StageFingerprint`/`StageCaptureListener`/`StageAdmissionCheck`).** Resolves the reconciliation
+     concern this section previously flagged, but differently than anticipated: rather than
+     translating `initialPlan` tree POSITIONS into runtime-adapted stage positions, identity is
+     made content-addressed across both plan generations — the check side fingerprints every
+     `Exchange` subtree found in `initialPlan`, the capture side fingerprints each materialized
+     `ShuffleQueryStageExec`'s own exchange subtree from the FINAL plan, and
+     `ColumnarToRowExec`/`InputAdapter`/`WholeStageCodegenExec`/`AQEShuffleReadExec` (execution-detail
+     wrappers with no counterpart in `initialPlan`) are treated as transparent so the identical
+     logical subtree hashes identically on both sides. Verified by actually running a shuffle query
+     and asserting digest equality across two independently-planned `DataFrame`s, not assumed. A
+     real bug found in the process: the first capture-side implementation called `.collect` directly
+     on `queryExecution.executedPlan` and silently found zero stages, because
+     `AdaptiveSparkPlanExec` is itself a `LeafExecNode` (`.children == Nil`) — the exact same trap
+     `WholePlanFingerprint`'s own doc comment already warns about, hit again by not reusing the
+     lesson; fixed by unwrapping to `.executedPlan` internally before collecting. Real runtime
+     statistics (`numMappers`/`numPartitions`/`bytesByPartition` from `ShuffleExchangeLike` and
+     `MapOutputStatistics`, all real public accessors) replace Phase 1's honest placeholders for
+     stage anchors specifically — the whole-query anchor `SparkResumeListener` writes is
+     unchanged and still placeholder. NOT reattachable: no `ExchangeStore` is wired to per-stage
+     anchors in this phase (`Anchor.handleKind` is the disclosed sentinel
+     `StageCaptureListener.NoHandleKind`) — this proves per-stage IDENTITY and STATISTICS only.
+     Disclosed, not tested: AQE's skew-join-split optimization was not specifically exercised: the
+     content-addressing approach should be unaffected (it reads the shuffle's own write-side stats,
+     not the coalesced/split read side), but that is reasoning from the mechanism, not a dedicated
+     test, and should get one before this is trusted for a skew-heavy workload.
+   - Iceberg fingerprint provider, Redis anchor store — remaining, not yet built.
 4. **Phase 3 — first real `ExchangeStore` implementation for a disaggregated shuffle backend**,
    built and proven as an out-of-tree consumer first (see Appendix B), evaluated for in-tree
    inclusion only after it has its own independent track record.

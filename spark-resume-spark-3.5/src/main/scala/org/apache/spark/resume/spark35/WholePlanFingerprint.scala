@@ -2,8 +2,8 @@ package org.apache.spark.resume.spark35
 
 import scala.util.control.NonFatal
 
-import org.apache.spark.sql.execution.SparkPlan
-import org.apache.spark.sql.execution.adaptive.{AdaptiveSparkPlanExec, QueryStageExec}
+import org.apache.spark.sql.execution.{ColumnarToRowExec, InputAdapter, SparkPlan, WholeStageCodegenExec}
+import org.apache.spark.sql.execution.adaptive.{AdaptiveSparkPlanExec, AQEShuffleReadExec, QueryStageExec}
 
 import org.apache.spark.resume.api.SourceFingerprint
 
@@ -62,6 +62,18 @@ object WholePlanFingerprint {
       walk(adaptive.initialPlan, path, sb, providers)
     case stage: QueryStageExec =>
       walk(stage.plan, path, sb, providers)
+    // Execution-detail wrapper nodes with no counterpart in `initialPlan` -- they are inserted by
+    // Spark's own plan-preparation/whole-stage-codegen pass, which only ever runs on a plan that
+    // is about to be (or has already been) executed, never on `initialPlan` itself. Transparent
+    // (contribute nothing, unwrap to the single child) so that [[StageFingerprint]] can hash the
+    // SAME logical subtree from both the pre-execution side (`initialPlan`, none of these exist)
+    // and the post-execution side (a materialized `ShuffleQueryStageExec`'s subtree, wrapped in
+    // all of them) and get an IDENTICAL digest -- verified necessary by testing, not predicted:
+    // without this, `StageFingerprintSpec`'s check-side/capture-side digest-equality test fails.
+    case c: ColumnarToRowExec => walk(c.child, path, sb, providers)
+    case a: InputAdapter => walk(a.child, path, sb, providers)
+    case w: WholeStageCodegenExec => walk(w.child, path, sb, providers)
+    case r: AQEShuffleReadExec => walk(r.child, path, sb, providers)
     case leaf if leaf.children.isEmpty =>
       sb.append(s"[$path]LEAF:${leafFingerprint(leaf, providers)}\n")
     case node =>

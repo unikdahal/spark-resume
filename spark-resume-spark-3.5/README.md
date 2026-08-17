@@ -11,9 +11,24 @@ scope.
 `SparkSession`, look it up from a completely independent second `SparkSession`, and get a correct
 admission decision — `Admitted` for the identical query, `Rejected` for a structurally different
 one, and (the go/no-go case) `Rejected` when the underlying file was mutated between capture and
-check, not silently admitted. 41 tests across the whole repo, `mvn clean install`, reproduced
-clean across 5 consecutive full runs (see the async-listener-bus bug below for why that specific
-number of reruns mattered here).
+check, not silently admitted. `StageAdmissionCheckIntegrationSpec` proves the same claim at
+per-stage granularity (see below). 48 tests across the whole repo, `mvn clean install`, reproduced
+clean across multiple consecutive full runs (see the async-listener-bus bug below for why rerun
+count mattered here).
+
+## Per-stage fingerprinting (`StageFingerprint` / `StageCaptureListener` / `StageAdmissionCheck`)
+
+The Tier-1-only degradation of the Tier 2 extension point above: no public hook fires at a
+stage's own materialization moment, so per-stage identity is recovered by fingerprinting the same
+exchange subtree from both sides of the capture/check split and matching by CONTENT, not tree
+position. See `StageFingerprint`'s doc comment for the full mechanism, `StageFingerprintSpec` for
+the proof (a real shuffle query's check-side digest, computed before it ever runs, verified equal
+to its own capture-side digest computed after it does), and `StageAdmissionCheckIntegrationSpec`
+for the same end-to-end wiring `AdmissionCheckIntegrationSpec` proves for the whole-query path.
+Per-stage anchors carry REAL runtime statistics (`numMappers`/`numPartitions`/`bytesByPartition`,
+straight from `ShuffleExchangeLike` and `MapOutputStatistics`) rather than the whole-query
+listener's placeholders — but are NOT reattachable in this phase (`Anchor.handleKind` is the
+disclosed sentinel `StageCaptureListener.NoHandleKind`; no `ExchangeStore` is wired to them yet).
 
 ## What this does NOT prove
 
