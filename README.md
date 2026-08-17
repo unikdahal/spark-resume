@@ -19,26 +19,35 @@ what this project explicitly does *not* attempt to solve.
 
 ## Status
 
-**Phase 0, in progress.** `spark-resume-api` (the SPI) and `spark-resume-core` (the admission
-engine and the identity-isolation-safe reattach path) exist, build, and are tested — 25/25 tests
-passing, including a real-concurrency fencing test and full coverage of the fail-closed admission
-semantics. **There is no Spark integration yet.** Nothing in this repository should be described
-as production-ready until a real engine integration (Phase 1+) exists and has its own test
-coverage — see the roadmap in `docs/DESIGN.md` §14.
+**Phase 0 done, Phase 1 done.** `spark-resume-api` (the SPI) + `spark-resume-core` (the admission
+engine, the identity-isolation-safe reattach path) + `spark-resume-spark-3.5` (Tier 1 Spark 3.5
+integration: real-plan fingerprinting + a real capture/check decision-layer proof against two
+independent `SparkSession`s) all build and are tested — 41/41 tests, `mvn clean install`,
+reproduced clean across 5 consecutive full runs. **Still no execution-skip mechanism anywhere in
+this repository** — Tier 1 has no public Spark extension point to substitute a stage's previously-
+computed output for real execution; that needs Tier 2/3 (Phase 2+), which do not exist yet. Read
+`spark-resume-spark-3.5/README.md`'s "What this does NOT prove" section before assuming more than
+that. Nothing here should be described as production-ready — see `docs/DESIGN.md` §14 for the
+roadmap and what each remaining phase needs to add before that claim would be earned.
 
 ## Repository layout
 
 ```
-spark-resume-api/    the SPI: ExchangeStore, AnchorStore, SourceFingerprint, AdmissionRule, and
-                      their plain data types, plus an in-memory reference implementation of each
-                      store (dev/test only -- no cross-process durability) and the conformance
-                      testkit (AnchorStoreContract / ExchangeStoreContract) any real
-                      implementation is expected to pass. Zero Spark dependency.
-spark-resume-core/   the admission engine (the rule-chain runner) and SafeReattach, the single
-                      enforced choke point through which this project ever calls
-                      ExchangeStore.reattach. Depends on spark-resume-api only.
-docs/DESIGN.md        the full architecture design: concepts, invariants, the SPI in depth, the
-                      three-tier Spark integration strategy, and the roadmap.
+spark-resume-api/         the SPI: ExchangeStore, AnchorStore, SourceFingerprint, AdmissionRule,
+                           and their plain data types, plus an in-memory reference implementation
+                           of each store (dev/test only -- no cross-process durability) and the
+                           conformance testkit (AnchorStoreContract / ExchangeStoreContract) any
+                           real implementation is expected to pass. Zero Spark dependency.
+spark-resume-core/        the admission engine (the rule-chain runner) and SafeReattach, the
+                           single enforced choke point through which this project ever calls
+                           ExchangeStore.reattach. Depends on spark-resume-api only.
+spark-resume-spark-3.5/   Tier 1 Spark 3.5 integration: real physical-plan fingerprinting
+                           (file-source scans + a generic, disclosed fallback for anything else),
+                           a QueryExecutionListener-based capture path, and the admission check
+                           that ties them to spark-resume-core. See its own README for what it
+                           proves, what it doesn't, and the real bugs found building it.
+docs/DESIGN.md             the full architecture design: concepts, invariants, the SPI in depth,
+                           the three-tier Spark integration strategy, and the roadmap.
 ```
 
 ## Building

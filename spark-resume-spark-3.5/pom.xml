@@ -1,0 +1,113 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Tier 1 Spark 3.5 integration (design doc sec 8): fingerprinting a real physical plan and driving
+  spark-resume-core's AdmissionEngine off it, built entirely on public Spark APIs
+  (QueryExecutionListener, SparkPlan traversal, FileSourceScanExec's public fields). No Tier 2/3
+  work here: no AQE per-stage interception, no real cross-process shuffle backend. What this
+  module can and cannot prove is stated plainly in README.md and docs/DESIGN.md.
+
+  Spark is `provided` scope on purpose: this is a library an application's own Spark classpath
+  supplies Spark to, not a fat jar that drags a second copy of Spark along with it.
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>org.apache.spark.resume</groupId>
+    <artifactId>spark-resume-parent</artifactId>
+    <version>0.1.0-SNAPSHOT</version>
+  </parent>
+
+  <artifactId>spark-resume-spark-3.5_2.12</artifactId>
+  <packaging>jar</packaging>
+
+  <properties>
+    <!-- A real, published, vanilla Apache Spark release : not a private fork : so this module's
+         "Spark 3.5 compatible" claim is verifiable by anyone against a plain Spark install. -->
+    <spark.version>3.5.9</spark.version>
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>org.scala-lang</groupId>
+      <artifactId>scala-library</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.spark.resume</groupId>
+      <artifactId>spark-resume-api_2.12</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.spark.resume</groupId>
+      <artifactId>spark-resume-core_2.12</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.spark</groupId>
+      <artifactId>spark-core_2.12</artifactId>
+      <version>${spark.version}</version>
+      <scope>provided</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.spark</groupId>
+      <artifactId>spark-sql_2.12</artifactId>
+      <version>${spark.version}</version>
+      <scope>provided</scope>
+    </dependency>
+    <!-- Not re-declared at test scope: Maven's `provided` scope is already on both the compile
+         AND test classpaths (just excluded from the packaged runtime classpath), so the two
+         declarations above cover the test suite's real local SparkSession too. A duplicate
+         test-scope re-declaration here was tried first and was actively wrong, not just
+         redundant: Maven collapsed the two same-GA declarations down to the LAST one's scope,
+         which silently dropped Spark off the COMPILE classpath entirely (`object sql is not a
+         member of package org.apache.spark`): found by the compile actually failing, not
+         predicted. -->
+    <dependency>
+      <groupId>org.scalatest</groupId>
+      <artifactId>scalatest_${scala.binary.version}</artifactId>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <sourceDirectory>src/main/scala</sourceDirectory>
+    <testSourceDirectory>src/test/scala</testSourceDirectory>
+    <plugins>
+      <plugin>
+        <groupId>net.alchim31.maven</groupId>
+        <artifactId>scala-maven-plugin</artifactId>
+      </plugin>
+      <plugin>
+        <groupId>org.scalatest</groupId>
+        <artifactId>scalatest-maven-plugin</artifactId>
+        <configuration>
+          <!-- Spark's own local-mode tests need real memory and time, and JDK 17 blocks reflective
+               access several of Spark's own dependencies (Hadoop's UserGroupInformation, Kryo,
+               Netty) use internally without these opens: found empirically (a bare -Xmx2g run
+               fails every single test with "getSubject is not supported"), same JDK 17 tax every
+               other Spark-on-17 setup in this project's history has had to pay. -->
+          <argLine>
+            -Xmx2g
+            --add-opens=java.base/java.lang=ALL-UNNAMED
+            --add-opens=java.base/java.lang.invoke=ALL-UNNAMED
+            --add-opens=java.base/java.lang.reflect=ALL-UNNAMED
+            --add-opens=java.base/java.io=ALL-UNNAMED
+            --add-opens=java.base/java.net=ALL-UNNAMED
+            --add-opens=java.base/java.nio=ALL-UNNAMED
+            --add-opens=java.base/java.util=ALL-UNNAMED
+            --add-opens=java.base/java.util.concurrent=ALL-UNNAMED
+            --add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED
+            --add-opens=java.base/jdk.internal.misc=ALL-UNNAMED
+            --add-opens=java.base/sun.nio.ch=ALL-UNNAMED
+            --add-opens=java.base/sun.nio.cs=ALL-UNNAMED
+            --add-opens=java.base/sun.security.action=ALL-UNNAMED
+            --add-opens=java.base/sun.util.calendar=ALL-UNNAMED
+            --add-opens=java.security.jgss/sun.security.krb5=ALL-UNNAMED
+          </argLine>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+</project>

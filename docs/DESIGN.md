@@ -1,8 +1,11 @@
 # Design: a generic shuffle/stage resumption library for Apache Spark
 
-Status: **Phase 0 in progress.** `spark-resume-api` (the SPI) and `spark-resume-core` (the
-admission engine + the identity-isolation-safe reattach path) are built and tested — 25/25 tests
-passing, see the repo root README. No Spark integration exists yet (Phase 1+). This document
+Status: **Phase 0 and Phase 1 done.** `spark-resume-api` (the SPI), `spark-resume-core` (the
+admission engine + the identity-isolation-safe reattach path), and `spark-resume-spark-3.5`
+(Tier 1 Spark integration: real-plan fingerprinting, capture, and admission-check, proven across
+two independent `SparkSession`s) are built and tested — 41/41 tests, reproduced clean across 5
+consecutive full runs, see the repo root README and `spark-resume-spark-3.5/README.md`. Still no
+execution-skip mechanism (Phase 2+, Tier 2/3). This document
 specifies the architecture for the project as a whole — provisionally named `spark-resume` (see
 Appendix A) — that generalizes a mechanism proven across several proof-of-concept repositories
 into a real, pluggable, production-grade library. It intentionally contains no reference to any
@@ -469,12 +472,30 @@ metrics system (a `Source` registered the standard way), not a bespoke reporting
    them — 25/25 tests passing. What Phase 0 does NOT claim: this is a tested SPI plus an
    in-memory store, nothing more. No Spark dependency exists anywhere in this repository yet, and
    nothing here should be called production-ready until Phase 1+ lands with its own coverage.
-2. **Phase 1 — Tier 1 Spark 3.5 integration + file-source fingerprinting + in-memory store.** A
-   working, if coarse-grained (whole-query, not per-stage), resumption path usable for real
-   experimentation.
+2. **Phase 1 — Tier 1 Spark 3.5 integration + file-source fingerprinting — DONE, in
+   `spark-resume-spark-3.5`.** A real physical-plan fingerprinter (`FileSourceFingerprint` for
+   the built-in file-source scan, a disclosed generic fallback for everything else),
+   `SparkResumeListener` (capture, via `QueryExecutionListener`) and `AdmissionCheck` (the check),
+   proven end to end across two independent `SparkSession`s: correct `Admitted`/`Rejected`
+   decisions, including the go/no-go mutated-source case. What Phase 1 does NOT claim: no
+   execution is ever skipped — there is still no public extension point to substitute a stage's
+   output for real execution (that's Tier 2/3, Phase 2+); this proves the DECISION layer only.
+   Three real bugs found building and testing it (`AdaptiveSparkPlanExec.executedPlan` mutating in
+   place mid-adaptive-execution vs. its immutable `initialPlan`; `Expression.canonicalized` not
+   stripping `exprId`, invisible to a single-session test suite; `QueryExecutionListener`'s
+   asynchronous delivery racing an immediate unregister, reproducing only ~1 run in 3–4 across
+   full-suite runs) — see `spark-resume-spark-3.5/README.md` for the full account of each.
 3. **Phase 2 — Tier 2 extension point (or its Tier-1-only degradation), per-stage fingerprinting,
    Iceberg fingerprint provider, Redis anchor store.** This is the phase that reaches parity with
-   what the prototypes already proved, built cleanly and generically instead of ad hoc.
+   what the prototypes already proved, built cleanly and generically instead of ad hoc. Carries
+   forward a consequence of Phase 1's `initialPlan` fix (bug fixed, but the shape mismatch it
+   trades away is not): a capture's anchor records `numPartitions`/statistics from the
+   post-execution plan while its fingerprint identity is keyed off the pre-adaptive `initialPlan`
+   shape, so a run where AQE coalesced partitions or split a skew join writes an anchor whose
+   identity cannot see the adaptation that produced its own numbers. Harmless at Phase 1 (nothing
+   consumes those numbers yet), but per-stage fingerprinting/adoption in this phase MUST reconcile
+   `initialPlan`-based identity with the runtime-adapted stage shape before trusting a match — this
+   is exactly the false-positive-resumption surface A-1 exists to guard.
 4. **Phase 3 — first real `ExchangeStore` implementation for a disaggregated shuffle backend**,
    built and proven as an out-of-tree consumer first (see Appendix B), evaluated for in-tree
    inclusion only after it has its own independent track record.
