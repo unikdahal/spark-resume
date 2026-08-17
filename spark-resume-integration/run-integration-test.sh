@@ -36,19 +36,30 @@ if ! curl -sf --max-time 3 "${CELEBORN_MASTER_REST}/api/v1/applications" >/dev/n
   exit 1
 fi
 
-# One value shared by BOTH separately-launched processes -- a fresh one per run so repeated runs
-# never collide on the same Redis key / Celeborn appUniqueId.
-export INTEGRATION_QUERY_ID="integration-$(date +%s)-$$"
-echo "== INTEGRATION_QUERY_ID=${INTEGRATION_QUERY_ID} =="
-
 echo "== building this module and its dependencies =="
 cd "$REPO_ROOT"
 mvn -o -pl spark-resume-api,spark-resume-core,spark-resume-spark-3.5,spark-resume-redis,spark-resume-celeborn,spark-resume-integration -am -DskipTests -Dmaven.test.skip=true install
 
-echo "== ProcessA (producing side) -- its own JVM =="
-mvn -o -pl spark-resume-integration test -Dspark.resume.integration.skipTests=false -Dsuites=org.apache.spark.resume.integration.ProcessASpec
+# Every real, disclosed terminal outcome this pipeline can reach today -- see ProcessB's doc
+# comment for exactly what real backend behavior each one proves. Each scenario gets its own
+# INTEGRATION_QUERY_ID (so Redis keys / Celeborn appUniqueIds never collide across scenarios) and
+# its own pair of ProcessA/ProcessB JVMs.
+SCENARIOS=(admitted stale isolation-conflict miss)
 
-echo "== ProcessB (resuming side) -- a SEPARATE, later-launched JVM =="
-mvn -o -pl spark-resume-integration test -Dspark.resume.integration.skipTests=false -Dsuites=org.apache.spark.resume.integration.ProcessBSpec
+for scenario in "${SCENARIOS[@]}"; do
+  export INTEGRATION_SCENARIO="$scenario"
+  export INTEGRATION_QUERY_ID="integration-${scenario}-$(date +%s)-$$"
+  echo ""
+  echo "== scenario=${scenario} INTEGRATION_QUERY_ID=${INTEGRATION_QUERY_ID} =="
 
-echo "== SUCCESS: full pipeline composed end-to-end across two real processes, a real Redis, and a real Celeborn cluster =="
+  echo "-- ProcessA (producing side) -- its own JVM --"
+  mvn -o -pl spark-resume-integration test -Dspark.resume.integration.skipTests=false -Dsuites=org.apache.spark.resume.integration.ProcessASpec
+
+  echo "-- ProcessB (resuming side) -- a SEPARATE, later-launched JVM --"
+  mvn -o -pl spark-resume-integration test -Dspark.resume.integration.skipTests=false -Dsuites=org.apache.spark.resume.integration.ProcessBSpec
+
+  echo "== scenario=${scenario} SUCCESS =="
+done
+
+echo ""
+echo "== SUCCESS: every scenario (${SCENARIOS[*]}) composed end-to-end across two real processes, a real Redis, and a real Celeborn cluster =="

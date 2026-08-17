@@ -30,11 +30,19 @@ import org.apache.spark.resume.spark35.{StageCaptureListener, StageFingerprint}
   * scheme -- both real design decisions belonging to a future phase, not this one. This process
   * instead builds the real `CelebornHandle` itself, exactly the way an operator manually wiring
   * these two systems together today would have to. See README.md's "What this proves, and what it
-  * doesn't" section. */
+  * doesn't" section.
+  *
+  * `INTEGRATION_SCENARIO` (default `"admitted"`) selects which real, disclosed outcome this run
+  * is proving composes end to end (see `ProcessB`'s doc comment for the full outcome-by-scenario
+  * table): every scenario other than `"stale"` registers a REAL Celeborn shuffle exactly the same
+  * way. `"stale"` deliberately does NOT -- it writes an anchor carrying a `CelebornHandle` that
+  * was never registered at all, so `ProcessB`'s `SafeReattach.attempt` reaches `RefusedStale` via
+  * the backend's own real `isFresh` check, not a fabricated/mocked one. */
 object ProcessA {
 
   def main(args: Array[String]): Unit = {
     val queryId = requireEnv("INTEGRATION_QUERY_ID")
+    val scenario = sys.env.getOrElse("INTEGRATION_SCENARIO", "admitted")
     val redisHost = sys.env.getOrElse("REDIS_HOST", "localhost")
     val redisPort = sys.env.getOrElse("REDIS_PORT", "6379").toInt
     val celebornRestBaseUrl = sys.env.getOrElse("CELEBORN_MASTER_REST", "http://localhost:9098")
@@ -51,15 +59,22 @@ object ProcessA {
       df.collect() // materialize the real shuffle
       val stages = StageFingerprint.capturedStages(df.queryExecution.executedPlan, Seq.empty)
       require(stages.nonEmpty, "fixture query produced no shuffle stage -- fixture bug, not a real finding")
-      println(s"[ProcessA] captured ${stages.size} real shuffle stage(s)")
+      println(s"[ProcessA] captured ${stages.size} real shuffle stage(s), scenario=$scenario")
 
-      registerRealCelebornShuffle(producingAppUniqueId, celebornMasterEndpoint)
       // masterRestBaseUrl only, here: this store is used purely to get at handleKind/
       // serializeHandle, both of which don't touch the "caller identity" constructor arg at all --
       // that arg only matters for checkIdentityIsolation, a RESUMING-driver-side check ProcessA
       // never calls.
       val celebornStore = new CelebornExchangeStore(celebornRestBaseUrl, s"unused-producer-side-$queryId")
-      val handle = CelebornHandle(producingAppUniqueId, shuffleId = 1)
+      val handle =
+        if (scenario == "stale") {
+          // Deliberately never registered anywhere -- see this object's doc comment.
+          println("[ProcessA] scenario=stale: NOT registering a real shuffle; handle points at one that never existed")
+          CelebornHandle(s"never-registered-$queryId", shuffleId = 1)
+        } else {
+          registerRealCelebornShuffle(producingAppUniqueId, celebornMasterEndpoint)
+          CelebornHandle(producingAppUniqueId, shuffleId = 1)
+        }
       val handlePayload = celebornStore.serializeHandle(handle)
 
       val redisStore = new RedisAnchorStore(redisHost, redisPort)
@@ -82,8 +97,8 @@ object ProcessA {
           val ok = redisStore.putAnchor(generation, anchor)
           require(ok, "putAnchor refused under a freshly acquired generation -- should be impossible")
         }
-        println(s"[ProcessA] wrote ${stages.size} real anchor(s) carrying a real CelebornHandle " +
-          s"(appUniqueId=$producingAppUniqueId, shuffleId=1) to Redis under queryId=$stageQueryId, generation=$generation")
+        println(s"[ProcessA] wrote ${stages.size} anchor(s) carrying handle=$handle " +
+          s"to Redis under queryId=$stageQueryId, generation=$generation")
       } finally {
         redisStore.close()
       }

@@ -78,6 +78,37 @@ class WholePlanFingerprintSpec extends SparkTestBase {
     }
   }
 
+  test("GO/NO-GO: round-robin repartition(n) with a DIFFERENT n produces a DIFFERENT fingerprint " +
+    "-- found by spark-resume-integration's real cross-process testing, not by inspection") {
+    withNewSession() { spark =>
+      // `df.repartition(n)` (no columns) plans to a ShuffleExchangeExec whose outputPartitioning
+      // is a RoundRobinPartitioning(n) -- caught by the generic NODE branch, NOT the leaf branch,
+      // so this is a DIFFERENT bug shape than the RangeExec one above: `RoundRobinPartitioning`
+      // does not extend Catalyst's `Expression` (unlike `HashPartitioning`/`RangePartitioning`,
+      // which do, and so happened to be visible via `.expressions` already), so it was invisible
+      // to `exprString` (`.expressions`-only) entirely. Before `partitioningString` was added,
+      // repartition(3) and repartition(7) over the IDENTICAL source hashed IDENTICALLY -- a real
+      // A-1 false-positive-resumption hazard this project's own methodology exists to catch, and
+      // did: found while extending spark-resume-integration's real two-process test to a "miss"
+      // scenario (a structurally different query expected to NOT match), which unexpectedly
+      // matched against a real Redis + real Celeborn cluster.
+      val df3 = spark.range(0, 4000, 1, 4).repartition(3)
+      val df7 = spark.range(0, 4000, 1, 4).repartition(7)
+      val fp3 = WholePlanFingerprint.compute(df3.queryExecution.executedPlan, providers)
+      val fp7 = WholePlanFingerprint.compute(df7.queryExecution.executedPlan, providers)
+      fp3 should not be fp7
+    }
+  }
+
+  test("STABILITY: round-robin repartition(n) with the SAME n, run twice, is stable") {
+    withNewSession() { spark =>
+      val a = spark.range(0, 4000, 1, 4).repartition(3)
+      val b = spark.range(0, 4000, 1, 4).repartition(3)
+      WholePlanFingerprint.compute(a.queryExecution.executedPlan, providers) shouldBe
+        WholePlanFingerprint.compute(b.queryExecution.executedPlan, providers)
+    }
+  }
+
   test("a provider that THROWS degrades this leaf to the fallback rather than crashing the whole computation") {
     val throwingProvider = new org.apache.spark.resume.api.SourceFingerprint {
       override def supports(target: org.apache.spark.resume.api.FingerprintTarget): Boolean = true

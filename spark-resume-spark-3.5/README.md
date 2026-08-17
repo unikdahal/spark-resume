@@ -114,3 +114,16 @@ A fourth, smaller finding: a leaf node's fallback fingerprint (for a scan type w
 structurally different `RangeExec` plans (`range(0,10)` vs. `range(0,20)`) — `start`/`end`/`step`
 are plain constructor fields, not Catalyst `Expression`s, so `.expressions` never surfaced them.
 Fixed by folding the node's own `.toString()` into the fallback too.
+
+A fifth finding, the same bug shape hitting a NON-leaf node this time, found not by inspection but
+by `spark-resume-integration`'s real cross-process testing: the generic (non-leaf) node branch's
+`exprString` (`.expressions`-only, same accessor as above) silently dropped `RoundRobinPartitioning`
+entirely — what a plain `df.repartition(n)`, no columns, produces. `RoundRobinPartitioning` does
+not extend Catalyst's `Expression` (unlike `HashPartitioning`/`RangePartitioning`, which do, and so
+were already visible by accident), so `df.repartition(3)` and `df.repartition(7)` over the
+identical source hashed IDENTICALLY — a real A-1 false-positive-resumption hazard in Tier 1 itself,
+not a connector-specific gap. Fixed by also hashing `node.outputPartitioning.toString`
+(exprId-stripped) for every generic node — safe for any `SparkPlan`, not just `Exchange`, since
+`outputPartitioning` is defined unconditionally on the base trait. See
+`WholePlanFingerprint.partitioningString`'s doc comment and `WholePlanFingerprintSpec`'s two new
+tests. No regression across the rest of the suite (28/28 after the fix, up from 26/26 before).

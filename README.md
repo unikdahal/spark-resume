@@ -28,15 +28,21 @@ independent `SparkSession`s at both granularities) + `spark-resume-iceberg` (an 
 `SourceFingerprint` keyed on the resolved snapshot id) + `spark-resume-redis` (the first real,
 cross-process `AnchorStore`, atomic fencing proven against a real Redis server) +
 `spark-resume-celeborn` (the first real, cross-process `ExchangeStore`, against a real vanilla
-Celeborn cluster) all build and are tested — 90/90 tests, `mvn clean install` (needs a real Redis
+Celeborn cluster) all build and are tested — 92/92 tests, `mvn clean install` (needs a real Redis
 reachable for `spark-resume-redis` and a real Celeborn cluster reachable for
 `spark-resume-celeborn` — see each module's README), reproduced clean across multiple consecutive
-full runs. `spark-resume-integration` (not counted in the 90 — see below) adds a real TWO-PROCESS
+full runs. `spark-resume-integration` (not counted in the 92 — see below) adds a real TWO-PROCESS
 proof that the whole pipeline — Spark capture, Redis anchor, cross-process admission,
-`SafeReattach` — composes end to end against real backends, terminating in the same disclosed
-`RefusedUnsupported` gap, not a silent success; it is deliberately NOT run by a bare `mvn install`
-(that would run its two processes in one JVM, exactly the anti-pattern its design exists to avoid)
-— run it explicitly via `spark-resume-integration/run-integration-test.sh`.
+`SafeReattach` — composes end to end against real backends, across FOUR real scenarios (admitted →
+`RefusedUnsupported`, stale → `RefusedStale`, isolation-conflict → `RefusedIsolationConflict`, miss
+→ every decision rejected, `SafeReattach` never called), not a silent success and not just the one
+happy path; it is deliberately NOT run by a bare `mvn install` (that would run its two processes in
+one JVM, exactly the anti-pattern its design exists to avoid) — run it explicitly via
+`spark-resume-integration/run-integration-test.sh`. Extending it to the `miss` scenario found a
+real Tier 1 bug in `spark-resume-spark-3.5` itself: `repartition(3)` and `repartition(7)` over the
+identical source fingerprinted IDENTICALLY (`RoundRobinPartitioning` isn't a Catalyst `Expression`,
+so it was invisible to the walker) — fixed, with two new committed regression tests; see
+`spark-resume-spark-3.5/README.md`.
 **Still no execution-skip mechanism anywhere in this repository**, and two real, disclosed gaps
 ship rather than a fully clean bill of health: a confirmed A-1 race in `spark-resume-iceberg`'s
 unpinned-read path (the default `FileSourceFingerprint` provider was checked against the same race

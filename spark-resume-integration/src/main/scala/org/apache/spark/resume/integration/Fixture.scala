@@ -10,12 +10,19 @@ import org.apache.spark.sql.{DataFrame, SparkSession}
   * counters would otherwise make an identical query fingerprint differently. This module composes
   * that already-proven property across a REAL OS process boundary rather than reproving it.
   *
-  * `repartition(3)` (not an aggregation) is deliberate: the simplest shape guaranteed to produce
+  * `repartition(n)` (not an aggregation) is deliberate: the simplest shape guaranteed to produce
   * exactly one `Exchange`/`ShuffleQueryStageExec`, so this module's assertions ("exactly one
   * admitted, reattachable stage") don't have to account for AQE partition-coalescing collapsing
   * or splitting stage count in a way that would make this fixture's own shape part of what's
-  * under test, rather than the composition this module actually exists to prove. */
+  * under test, rather than the composition this module actually exists to prove.
+  *
+  * @param numPartitions the repartition target -- part of the plan `Exchange`'s own partitioning
+  *   spec, so a DIFFERENT value produces a DIFFERENT fingerprint (confirmed, not assumed --
+  *   `spark-resume-spark-3.5`'s own exchange-collision tests already prove structurally distinct
+  *   exchanges don't collide). `ProcessB`'s `miss` scenario deliberately passes a different value
+  *   than `ProcessA` used, to prove a genuine, real fingerprint miss (not just an admitted match)
+  *   also composes correctly across a real process boundary. */
 object Fixture {
-  def query(spark: SparkSession): DataFrame =
-    spark.range(0, 4000, 1, 4).repartition(3).toDF()
+  def query(spark: SparkSession, numPartitions: Int = 3): DataFrame =
+    spark.range(0, 4000, 1, 4).repartition(numPartitions).toDF()
 }

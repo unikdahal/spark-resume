@@ -15,7 +15,11 @@ exists solely to run `ProcessA`/`ProcessB` against real infrastructure.
 Two SEPARATE JVM processes, each its own `mvn test -Dsuites=...` invocation (not two specs sharing
 one JVM — see `ProcessASpec`/`ProcessBSpec`'s doc comments for why that split is load-bearing, not
 incidental: a single JVM proves nothing about cross-process durability, which is the whole reason
-this project exists):
+this project exists), run through FOUR real scenarios (`INTEGRATION_SCENARIO`, see `ProcessB`'s
+doc comment for the full table): `admitted` → `RefusedUnsupported`, `stale` → `RefusedStale`,
+`isolation-conflict` → `RefusedIsolationConflict`, and `miss` → every decision `RejectedBy` (no
+`SafeReattach` call at all). Every terminal state this pipeline can honestly reach today, proven
+against real backends, not just the one happy path.
 
 - **`ProcessA` (the producing side).** A real local `SparkSession` runs a real shuffle query
   (`Fixture.query`, a plain `repartition` — the simplest shape guaranteed to produce exactly one
@@ -67,7 +71,27 @@ REDIS_HOST=localhost REDIS_PORT=16379 ./run-integration-test.sh
 Does NOT stand up either backend itself (unlike `spark-resume-celeborn/run-celeborn-tests.sh`):
 both are already-proven, already-documented infrastructure this module composes against, not a
 third variant of the same clusters to maintain. Fails loudly, before running anything, if either
-is unreachable. Reproduced clean across repeated consecutive runs.
+is unreachable. Runs all four scenarios in sequence, each its own fresh `INTEGRATION_QUERY_ID` and
+its own ProcessA/ProcessB pair. Reproduced clean across repeated consecutive runs.
+
+## A real bug this module's own testing found, in `spark-resume-spark-3.5`
+
+Extending `ProcessB` to a `"miss"` scenario (a structurally different query — a different
+`repartition(n)` count — expected to find no matching anchor) unexpectedly still got `Admitted`
+against the real pipeline. Root cause, confirmed by direct probe: `WholePlanFingerprint`'s generic
+node branch fingerprinted a node via its class name plus `.expressions` only.
+`RoundRobinPartitioning` (what a plain `df.repartition(n)`, no columns, produces) does not extend
+Catalyst's `Expression` — unlike `HashPartitioning`/`RangePartitioning`, which do, and so were
+already visible by accident — so it was invisible to that walker entirely:
+`df.repartition(3)` and `df.repartition(7)` over the identical source hashed IDENTICALLY. A real
+A-1 false-positive-resumption hazard in Tier 1 itself, not a connector-specific gap, found by this
+module's own real cross-process, cross-backend testing rather than by inspection. Fixed in
+`WholePlanFingerprint` by also hashing `node.outputPartitioning.toString` (exprId-stripped, same as
+every other fingerprint input here) for every generic node — safe for any `SparkPlan`, not just
+`Exchange`, since `outputPartitioning` is defined unconditionally on the base trait. See
+`WholePlanFingerprint.partitioningString`'s doc comment and
+`WholePlanFingerprintSpec`'s two new committed tests for the full account. No regression across
+the rest of `spark-resume-spark-3.5`'s suite (28/28 after the fix, up from 26/26 before).
 
 ## A real debugging note
 

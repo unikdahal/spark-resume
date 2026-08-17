@@ -77,9 +77,29 @@ object WholePlanFingerprint {
     case leaf if leaf.children.isEmpty =>
       sb.append(s"[$path]LEAF:${leafFingerprint(leaf, providers)}\n")
     case node =>
-      sb.append(s"[$path]NODE:${node.getClass.getSimpleName}:${exprString(node)}\n")
+      sb.append(s"[$path]NODE:${node.getClass.getSimpleName}:${exprString(node)}:${partitioningString(node)}\n")
       node.children.zipWithIndex.foreach { case (child, i) => walk(child, s"$path.$i", sb, providers) }
   }
+
+  /** Found necessary by testing, not predicted, the same way `RangeExec`'s `.toString` fallback
+    * was (see `degradedFallback`'s doc comment): `exprString` alone (`.expressions`) silently
+    * DROPS a real, discriminating property for exactly one common shape --
+    * `RoundRobinPartitioning` (what a plain `df.repartition(n)`, no columns, produces) does NOT
+    * extend Catalyst's `Expression` (unlike `HashPartitioning`/`RangePartitioning`, which DO, and
+    * so were already visible via `.expressions` by accident), so it is invisible to `exprString`
+    * entirely -- confirmed empirically: `df.repartition(3)` and `df.repartition(7)` over the
+    * IDENTICAL source produced the IDENTICAL whole-plan fingerprint before this fix, a real A-1
+    * false-positive-resumption hazard (a resumed run whose actual partition count silently
+    * differs from what a prior anchor recorded would still be admitted). `outputPartitioning` is
+    * defined on every `SparkPlan` unconditionally (default `UnknownPartitioning(0)` when a node
+    * has no opinion), so including it here is always safe, not just for `Exchange` nodes -- this
+    * is not layered on top of `exprString`, it replaces reliance on the accident that some
+    * `Partitioning`s happen to also be `Expression`s. Same `ExprIdSuffix` stripping as
+    * `exprString`/`degradedFallback`, same reason: `HashPartitioning`'s own `toString` embeds its
+    * key expressions' `#<exprId>` suffixes, which would otherwise reintroduce the exact
+    * cross-session drift those two methods already guard against. */
+  private def partitioningString(node: SparkPlan): String =
+    ExprIdSuffix.replaceAllIn(node.outputPartitioning.toString, "")
 
   private def leafFingerprint(leaf: SparkPlan, providers: Seq[SourceFingerprint]): String = {
     val target = SparkPlanTarget(leaf)

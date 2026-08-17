@@ -9,10 +9,10 @@ now with a fourth `ReattachOutcome`, `RefusedUnsupported`), `spark-resume-spark-
 integration: whole-plan AND per-stage fingerprinting, capture, and admission-check, proven across
 two independent `SparkSession`s), `spark-resume-iceberg` (an Iceberg `SourceFingerprint`),
 `spark-resume-redis` (a real, cross-process `AnchorStore`), and `spark-resume-celeborn` (a real,
-cross-process `ExchangeStore`'s metadata half) are all built and tested — 90/90 tests, reproduced
+cross-process `ExchangeStore`'s metadata half) are all built and tested — 92/92 tests, reproduced
 clean across multiple full runs (needs a real Redis and a real Celeborn cluster reachable — see
 each module's README), see the repo root README and each module's own README.
-`spark-resume-integration` (not counted in the 90; deliberately excluded from a bare `mvn install`
+`spark-resume-integration` (not counted in the 92; deliberately excluded from a bare `mvn install`
 — see §14 Phase 3 and its own README) adds a real TWO-PROCESS proof the whole pipeline composes
 against real backends, terminating in the same disclosed `RefusedUnsupported` gap. Still no
 execution-skip mechanism anywhere (Phase 3+, Tier 2/3). This document
@@ -679,11 +679,34 @@ metrics system (a `Source` registered the standard way), not a bespoke reporting
    invocation — a genuine OS process boundary, not two specs sharing one JVM, since a single JVM
    would prove nothing about the cross-process durability this whole project exists for.
 
-   The terminal outcome is `RefusedUnsupported`, asserted explicitly — the honest end state this
-   pipeline reaches today. This is stronger evidence than three modules each passing alone: it
-   proves everything up to the backend byte-read composes correctly across real processes, and
-   that the one thing that doesn't work is exactly, and only, the already-disclosed Tier 3 gap —
-   not a silent success, and not a raw crash either.
+   Extended to FOUR real scenarios (`INTEGRATION_SCENARIO`), each proving a different real,
+   disclosed `SafeReattach` outcome composes end to end, not just the one happy path: `admitted` →
+   `RefusedUnsupported` (the Tier 3 gap); `stale` → `RefusedStale` (a real, never-registered
+   `CelebornHandle`, refused by the backend's own `isFresh`, not a fabricated one); `isolation-
+   conflict` → `RefusedIsolationConflict` (`ProcessB` reusing `ProcessA`'s own producing identity);
+   `miss` → every decision `RejectedBy` (no anchor matches a structurally different query), proving
+   `SafeReattach` is never even reached when it shouldn't be. Each is stronger evidence than one
+   module passing alone: it proves everything up to the backend byte-read composes correctly
+   across real processes, and that the only thing that doesn't work in the `admitted` case is
+   exactly, and only, the already-disclosed Tier 3 gap — not a silent success, and not a raw
+   crash either.
+
+   **A real Tier 1 bug this extension found, in `spark-resume-spark-3.5` itself, not a connector.**
+   The `miss` scenario (a `repartition(7)` query checked against an anchor written for
+   `repartition(3)`) unexpectedly got `Admitted` against the real pipeline. Root cause:
+   `WholePlanFingerprint`'s generic (non-leaf) node branch fingerprinted a node via class name plus
+   `.expressions` only — and `RoundRobinPartitioning` (what a plain `df.repartition(n)`, no
+   columns, produces) does not extend Catalyst's `Expression`, unlike `HashPartitioning`/
+   `RangePartitioning`, which do and so were already visible by accident — so it was invisible to
+   that walker entirely: `repartition(3)` and `repartition(7)` over the identical source hashed
+   IDENTICALLY. A genuine A-1 false-positive-resumption hazard in the core Tier 1 walker, found by
+   this module's own real cross-process testing rather than by inspection. Fixed by also hashing
+   `node.outputPartitioning.toString` (exprId-stripped, same convention as every other fingerprint
+   input) for every generic node — safe for any `SparkPlan`, since `outputPartitioning` is defined
+   unconditionally on the base trait, not just `Exchange`. No regression across the rest of
+   `spark-resume-spark-3.5`'s suite (28/28 after the fix, up from 26/26 before). See
+   `WholePlanFingerprint.partitioningString`'s doc comment and
+   `spark-resume-integration/README.md` for the full account.
 
    A real seam had to be bridged, not glossed over: `ExchangeStore` has no producer-side "issue me
    a handle" method (every method on that trait is a resuming-driver operation), so
