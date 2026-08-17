@@ -1,13 +1,17 @@
 # Design: a generic shuffle/stage resumption library for Apache Spark
 
-Status: **Phase 0, Phase 1, and Phase 2 done** (with a known, disclosed A-1 gap in the Iceberg
-provider's unpinned-read path — see §14 Phase 2). `spark-resume-api` (the SPI), `spark-resume-core`
-(the admission engine + the identity-isolation-safe reattach path), `spark-resume-spark-3.5` (Tier
-1 Spark integration: whole-plan AND per-stage fingerprinting, capture, and admission-check, proven
-across two independent `SparkSession`s), `spark-resume-iceberg` (an Iceberg `SourceFingerprint`),
-and `spark-resume-redis` (a real, cross-process `AnchorStore`) are all built and tested — 72/72
-tests, reproduced clean across multiple full runs (Redis running), see the repo root README and
-each module's own README. Still no execution-skip mechanism (Phase 3+, Tier 2/3). This document
+Status: **Phase 0, Phase 1, and Phase 2 done; Phase 3 underway** (one real backend done, honestly
+partial), with two known, disclosed gaps — an A-1 race in the Iceberg provider's unpinned-read
+path (§14 Phase 2) and a documented Tier 3 backend-capability gap in `spark-resume-celeborn`'s
+`reattach` (§14 Phase 3). `spark-resume-api` (the SPI), `spark-resume-core` (the admission engine +
+the identity-isolation-safe reattach path, now with a fourth `ReattachOutcome`,
+`RefusedUnsupported`), `spark-resume-spark-3.5` (Tier 1 Spark integration: whole-plan AND per-stage
+fingerprinting, capture, and admission-check, proven across two independent `SparkSession`s),
+`spark-resume-iceberg` (an Iceberg `SourceFingerprint`), `spark-resume-redis` (a real, cross-process
+`AnchorStore`), and `spark-resume-celeborn` (a real, cross-process `ExchangeStore`'s metadata half)
+are all built and tested — 90/90 tests, reproduced clean across multiple full runs (needs a real
+Redis and a real Celeborn cluster reachable — see each module's README), see the repo root README
+and each module's own README. Still no execution-skip mechanism anywhere (Phase 3+, Tier 2/3). This document
 specifies the architecture for the project as a whole — provisionally named `spark-resume` (see
 Appendix A) — that generalizes a mechanism proven across several proof-of-concept repositories
 into a real, pluggable, production-grade library. It intentionally contains no reference to any
@@ -620,9 +624,10 @@ metrics system (a `Source` registered the standard way), not a bespoke reporting
    `deserializeHandle`, `isFresh` (a live query against the master's admin REST API), and
    `checkIdentityIsolation` are real and tested against a real Celeborn master and worker
    (`ExchangeStoreContract`'s 8 tests, plus a `SafeReattach.attempt` end-to-end proof against the
-   real cluster). `checkIdentityIsolation` is a genuine, tested closing of a hazard prior work on
-   this idea only ever disclosed, never enforced in code: it refuses `IsolationConflict` when a
-   resuming driver's own `appUniqueId` matches the anchor's producing `appUniqueId`.
+   real cluster). `checkIdentityIsolation` is a genuine, tested guard against a real hazard: it
+   refuses `IsolationConflict` when a resuming driver's own `appUniqueId` matches the anchor's
+   producing `appUniqueId`, since Celeborn scopes a shuffle's registration to the `appUniqueId`
+   that created it and reusing that id would silently collide with already-materialized wire state.
 
    `reattach` throws a documented `UnsupportedOperationException` — Tier 3 exactly as this
    section's own header describes it, confirmed by checking vanilla Celeborn `0.7.0`'s actual
@@ -633,11 +638,9 @@ metrics system (a `Source` registered the standard way), not a bespoke reporting
    `RefusedUnsupported`, specifically because of this: `store.reattach` throwing
    `UnsupportedOperationException` would otherwise propagate a raw exception out of the ONE
    enforced choke point every driver-side integration calls `reattach` through, rather than the
-   structured refusal every OTHER gap in that function already produces. A real prior, private,
-   unpublished prototype needed to add exactly this missing capability (non-upstream
-   `LifecycleManager` methods) to make cross-application reattachment work at all — confirmation
-   that vanilla Celeborn genuinely lacks it, not evidence this project failed to find an existing
-   path.
+   structured refusal every OTHER gap in that function already produces. Adding cross-application
+   reattachment would require patching `LifecycleManager` itself (non-upstream additions), which
+   this project's clean-room, vanilla-Celeborn-only posture rules out.
 
    A real testkit finding surfaced building this: `ExchangeStoreContract`, as originally written,
    unconditionally required `reattach` to succeed in two of its eight tests — unsatisfiable by an

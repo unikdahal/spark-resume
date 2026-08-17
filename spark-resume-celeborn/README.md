@@ -26,13 +26,12 @@ real store in `SafeReattachIntegrationSpec`, not just documented.
 
 ## A real safety check, not just a disclosed hazard
 
-Earlier work on this general idea found, empirically, that a resuming driver launched under the
-same Celeborn `appUniqueId` as the run that produced an anchor risks silently colliding with that
-run's own wire state rather than cleanly reading its committed output. `checkIdentityIsolation`
+A resuming driver launched under the same Celeborn `appUniqueId` as the run that produced an
+anchor risks silently colliding with that run's own wire state rather than cleanly reading its
+committed output — Celeborn scopes a shuffle's registration to the `appUniqueId` that created it,
+so reusing that id is a self-inflicted identity collision, not a resumption. `checkIdentityIsolation`
 here is a real, enforced, tested check for exactly that: it compares the anchor's producing
-`appUniqueId` against the resuming driver's own, and refuses with `IsolationConflict` on a match —
-turning a previously-disclosed-but-unfixed mechanism-level hazard into an actual guarded property
-of this store.
+`appUniqueId` against the resuming driver's own, and refuses with `IsolationConflict` on a match.
 
 ## Running the tests — needs a real Celeborn cluster
 

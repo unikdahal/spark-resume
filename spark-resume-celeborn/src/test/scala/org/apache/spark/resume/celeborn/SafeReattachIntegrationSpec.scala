@@ -16,6 +16,9 @@ import org.apache.spark.resume.core._
   * pointed at a REAL Celeborn cluster, not a mock of either side. */
 class SafeReattachIntegrationSpec extends AnyFunSuite with Matchers {
 
+  // Does NOT stop the LifecycleManager after registering -- see CelebornExchangeStoreSpec's
+  // registerRealShuffle comment: stop() actively deregisters the shuffle at the master, which
+  // would invalidate the fixture before the test below gets to use it.
   private def registerRealShuffle(appUniqueId: String, shuffleId: Int): Unit = {
     val conf = new CelebornConf()
     conf.set("celeborn.master.endpoints", "localhost:9097")

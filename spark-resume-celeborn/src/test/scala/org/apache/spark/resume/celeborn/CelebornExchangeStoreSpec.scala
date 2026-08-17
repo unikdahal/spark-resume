@@ -52,6 +52,12 @@ class CelebornExchangeStoreSpec extends ExchangeStoreContract {
   override def conflictingIdentityHandle(store: ExchangeStore): Option[ExchangeHandle] =
     Some(CelebornHandle(callerAppUniqueId, 1))
 
+  // Deliberately does NOT stop `lifecycleManager` after registering: confirmed empirically that
+  // `LifecycleManager.stop()` actively deregisters the shuffle at the master (turned a "fresh"
+  // fixture into "not fresh" when tried) rather than being a passive resource release -- so
+  // stopping it here would silently invalidate every fixture built on top of this method. The
+  // registration is left live and owned by this short-lived test JVM for the rest of the run,
+  // same tradeoff `SafeReattachIntegrationSpec` makes.
   private def registerRealShuffle(appUniqueId: String, shuffleId: Int): Unit = {
     val conf = new CelebornConf()
     conf.set("celeborn.master.endpoints", s"${masterRpcEndpoint._1}:${masterRpcEndpoint._2}")

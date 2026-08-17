@@ -22,22 +22,20 @@ import org.apache.spark.resume.api._
   * public client API (`ShuffleClient`/`LifecycleManager`), not assumed: `ShuffleClient.readPartition`
   * and `registerMapPartitionTask` are scoped to the `LifecycleManager`/application that registered
   * the shuffle -- there is no public method anywhere in the client API to read a shuffle's
-  * committed partition locations under a DIFFERENT application's identity. (A prior, private,
-  * unpublished prototype needed to ADD exactly this capability -- non-upstream
-  * `LifecycleManager` methods -- to make cross-application reattachment work at all, which is
-  * itself confirmation that vanilla Celeborn genuinely lacks it, not evidence this project failed
-  * to find an existing path.) `reattach` throws `UnsupportedOperationException` naming this gap
-  * explicitly; `SafeReattach.attempt` (spark-resume-core) converts that into the structured
-  * `RefusedUnsupported` outcome, so a caller doing everything right gets a refusal, not a raw
-  * throw.
+  * committed partition locations under a DIFFERENT application's identity. Adding that capability
+  * would require patching `LifecycleManager` itself (non-upstream additions), which this project's
+  * clean-room, vanilla-Celeborn-only posture rules out. `reattach` throws
+  * `UnsupportedOperationException` naming this gap explicitly; `SafeReattach.attempt`
+  * (spark-resume-core) converts that into the structured `RefusedUnsupported` outcome, so a caller
+  * doing everything right gets a refusal, not a raw throw.
   *
   * @param masterRestBaseUrl e.g. `"http://localhost:9098"` -- the Celeborn master's admin REST
   *   endpoint (NOT its RPC port; a separate port, configured via `celeborn.master.http.host`/
   *   `celeborn.master.http.port` on the master).
   * @param callerAppUniqueId this DRIVER PROCESS's own Celeborn application identity -- the value
   *   this process would register shuffles under, if it were producing rather than resuming. Used
-  *   by [[checkIdentityIsolation]] to enforce the real hazard a prior prototype hit empirically:
-  *   a resuming driver that (through misconfiguration, not this library's own choice) launches
+  *   by [[checkIdentityIsolation]] to enforce a real hazard: a resuming driver that (through
+  *   misconfiguration, not this library's own choice) launches
   *   under the SAME `appUniqueId` as the run that produced the anchor being checked would
   *   silently collide with already-materialized shuffle state on the wire, rather than erroring
   *   (see that method's doc comment for the full account). */
