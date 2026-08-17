@@ -12,13 +12,18 @@ independent `SparkSession`s), `spark-resume-iceberg` (an Iceberg `SourceFingerpr
 `spark-resume-redis` (a real, cross-process `AnchorStore`), `spark-resume-celeborn` (a real,
 cross-process `ExchangeStore`'s metadata half), and `spark-resume-fs` (a second, independent
 `ExchangeStore`, filesystem-backed, no external infrastructure) are all built and tested —
-108/108 tests, reproduced clean across multiple full runs, verified 3x back-to-back with zero
+110/110 tests, reproduced clean across multiple full runs, verified 3x back-to-back with zero
 flakes (needs a real Redis and a real Celeborn cluster reachable — see each module's README), see
 the repo root README and each module's own README.
-`spark-resume-integration` (not counted in the 108; deliberately excluded from a bare `mvn install`
+`spark-resume-integration` (not counted in the 110; deliberately excluded from a bare `mvn install`
 — see §14 Phase 3 and its own README) adds a real TWO-PROCESS proof the whole pipeline composes
 against real backends, across FOUR real scenarios, verified 3x back-to-back (12/12 real process
-pairs, zero flakes). Still no execution-skip mechanism anywhere (Phase 3+, Tier 2/3). This document
+pairs, zero flakes). **Still no execution-skip mechanism built anywhere in this repository** —
+but, as of a Phase 4 correction (§8), no longer blocked on a missing Spark API either: a public
+Spark 3.5 hook (`injectQueryStagePrepRule`) proven, in a disclosed spike, to see a candidate stage
+before it materializes and to accept a leaf substitute that survives validation and produces
+correct results. What remains is real backend-read-path engineering, not an absent extension
+point. This document
 specifies the architecture for the project as a whole — provisionally named `spark-resume` (see
 Appendix A) — that generalizes a mechanism proven across several proof-of-concept repositories
 into a real, pluggable, production-grade library. It intentionally contains no reference to any
@@ -379,6 +384,40 @@ adapter degrades to Tier 1 only: fingerprinting/anchoring happens at coarser-gra
 reachable through public listeners (whole-query capture, not per-stage), which is strictly less
 capable but never incorrect — this is a capability degradation, governed by the same fail-closed
 posture as every other admission check (A-2).
+
+**Correction, Phase 4: Tier 2 as scoped above (a proposed NEW upstream extension point) turns out
+not to be needed at all — checked against real Spark 3.5.9 source, not assumed.**
+`SparkSessionExtensions.injectQueryStagePrepRule` (present since Spark 3.0, confirmed directly
+against `AdaptiveSparkPlanExec`'s actual 3.5.1 source, not inferred from newer-version docs) runs
+on the WHOLE plan once, at `AdaptiveSparkPlanExec` construction, BEFORE any `Exchange` is turned
+into a `QueryStageExec` and materialized — earlier than what Tier 2 above asked for (a
+post-materialization observation callback), and public today, not proposed. Two real gates were
+checked, not assumed, in a disclosed spike
+(`spark-resume-spark-3.5/.../AqeExecutionSkipSpikeSpec.scala`, committed, not production code):
+
+1. Does the injected rule see the plan at a point where it can identify WHICH stage it's looking
+   at — i.e., does its own digest of an `Exchange` node match what `StageAdmissionCheck` computes
+   independently for the same query? Confirmed: identical digest, every time.
+2. Does a LEAF replacement for an `Exchange` (children = `Nil`, so
+   `AdaptiveSparkPlanExec.createQueryStages`'s generic branch treats it as ALREADY materialized —
+   zero new query stages, zero task submission for that subtree) survive Spark's own validation
+   (`EnsureRequirements`/`ValidateSparkPlan`, both fixed built-ins that run BEFORE any injected
+   rule) and produce CORRECT final results downstream? Confirmed: a leaf declaring the same
+   `output`/`outputPartitioning`/`outputOrdering` as the `Exchange` it replaces survives, and a
+   downstream aggregation over the substituted subtree sums to the exact correct row count.
+
+**What this changes, precisely, and what it does NOT yet solve:** the long-standing "no
+execution-skip mechanism anywhere" status is no longer blocked at the Spark-API level for Spark
+3.5 — the interception point exists, is public, and has been proven to structurally work. What
+remains is real backend engineering, not a missing API: the spike's leaf node cheats by eagerly
+calling `ex.execute()` inside the rule and wrapping the result, still running the real shuffle
+once. Building a REAL skip requires a backend-aware `RDD` that reads actual partition bytes back
+from an `ExchangeStore.reattach` result inside `doExecute()` instead — real, substantial follow-on
+work (careful interaction with AQE's re-optimization-on-new-stats loop, columnar/broadcast
+variants, and only actually payable in production against a backend whose `reattach` is
+implemented — `spark-resume-celeborn`'s is not, `spark-resume-fs`'s is, making it this project's
+first buildable proof target). Not started as of this correction; a deliberate checkpoint, not
+an oversight — see the repo's own commit history for why.
 
 ## 9. Module layout
 

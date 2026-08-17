@@ -32,10 +32,10 @@ Celeborn cluster) + `spark-resume-fs` (a second, independent `ExchangeStore` imp
 filesystem-backed, real files, zero external infrastructure — proves `ExchangeStoreContract` is
 satisfiable by someone who didn't write it, and is the first real exerciser of the contract's
 reattach-SUCCESS path other than the in-memory reference implementation) all build and are tested
-— 108/108 tests, `mvn clean install` (needs a real Redis reachable for `spark-resume-redis` and a
+— 110/110 tests, `mvn clean install` (needs a real Redis reachable for `spark-resume-redis` and a
 real Celeborn cluster reachable for `spark-resume-celeborn` — see each module's README), reproduced
 clean across multiple consecutive full runs (verified 3x back-to-back with zero flakes after the
-partitioning fix below). `spark-resume-integration` (not counted in the 108 — see below) adds a real TWO-PROCESS
+partitioning fix below). `spark-resume-integration` (not counted in the 110 — see below) adds a real TWO-PROCESS
 proof that the whole pipeline — Spark capture, Redis anchor, cross-process admission,
 `SafeReattach` — composes end to end against real backends, across FOUR real scenarios (admitted →
 `RefusedUnsupported`, stale → `RefusedStale`, isolation-conflict → `RefusedIsolationConflict`, miss
@@ -47,8 +47,16 @@ real Tier 1 bug in `spark-resume-spark-3.5` itself: `repartition(3)` and `repart
 identical source fingerprinted IDENTICALLY (`RoundRobinPartitioning` isn't a Catalyst `Expression`,
 so it was invisible to the walker) — fixed, with two new committed regression tests; see
 `spark-resume-spark-3.5/README.md`.
-**Still no execution-skip mechanism anywhere in this repository**, and two real, disclosed gaps
-ship rather than a fully clean bill of health: a confirmed A-1 race in `spark-resume-iceberg`'s
+**Still no execution-skip mechanism built anywhere in this repository** — but as of a Phase 4
+finding, no longer blocked on a missing Spark API either: `SparkSessionExtensions
+.injectQueryStagePrepRule`, public since Spark 3.0, was proven in a disclosed spike
+(`spark-resume-spark-3.5`'s `AqeExecutionSkipSpikeSpec`) to see a candidate stage BEFORE it
+materializes and to accept a leaf substitute that survives Spark's own validation and produces
+correct results downstream — see `docs/DESIGN.md` §8's correction for the full account. What
+remains is real backend-read-path engineering (an `RDD` that reads actual bytes back from a real
+`ExchangeStore.reattach`, not the spike's eager-execute cheat), not an absent extension point. Two
+real, disclosed gaps still ship rather than a fully clean bill of health: a confirmed A-1 race in
+`spark-resume-iceberg`'s
 unpinned-read path (the default `FileSourceFingerprint` provider was checked against the same race
 and confirmed NOT vulnerable — Iceberg-specific, not architectural), and
 `spark-resume-celeborn`'s `reattach` is a documented `UnsupportedOperationException`, not a

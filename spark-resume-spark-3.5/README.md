@@ -59,11 +59,17 @@ same-digest anchors turned out to be implementation-specific (see `docs/DESIGN.m
 
 ## What this does NOT prove
 
-**No execution is ever skipped.** There is no public Spark 3.5 extension point that lets a
-library intercept an individual stage's execution and substitute previously-computed output —
-that is the Tier 2 extension point `docs/DESIGN.md` §8 proposes and does not yet have. What this
-module proves is the *decision* layer: given a real plan, would admission fire, and why. Turning
-an `Admitted` decision into an actual skipped stage needs Tier 2/3, which this phase has none of.
+**No execution is ever skipped, still — but this is now an unbuilt feature, not a blocked one.**
+A prior version of this README said there was no public Spark 3.5 extension point that could let a
+library intercept an individual stage's execution and substitute previously-computed output. That
+was checked again in Phase 4 and found wrong: `SparkSessionExtensions.injectQueryStagePrepRule`
+(public since Spark 3.0) runs on the whole plan BEFORE any `Exchange` materializes, and a disclosed
+spike (`AqeExecutionSkipSpikeSpec`, committed, not production code) proved a leaf substitute for an
+`Exchange` survives Spark's own validation and produces correct downstream results — see
+`docs/DESIGN.md` §8's correction. What this module proves TODAY is still only the *decision*
+layer: given a real plan, would admission fire, and why. Turning an `Admitted` decision into an
+actual skipped stage now needs real backend-read-path engineering (a backend-aware `RDD` inside
+`doExecute()`, not the spike's eager-execute cheat), not a missing Spark API.
 
 **Capture statistics are honest placeholders, not real measurements.** `SparkResumeListener`
 fires from `QueryExecutionListener.onSuccess`, after the whole query has already finished, with
@@ -127,3 +133,8 @@ not a connector-specific gap. Fixed by also hashing `node.outputPartitioning.toS
 `outputPartitioning` is defined unconditionally on the base trait. See
 `WholePlanFingerprint.partitioningString`'s doc comment and `WholePlanFingerprintSpec`'s two new
 tests. No regression across the rest of the suite (28/28 after the fix, up from 26/26 before).
+
+A sixth finding, positive this time, not a bug: this module's own long-standing claim ("no public
+Spark 3.5 extension point exists for execution-skipping") was checked again directly against 3.5.1
+source and found wrong. See "What this does NOT prove" above and `AqeExecutionSkipSpikeSpec` for
+the two gates proven.
