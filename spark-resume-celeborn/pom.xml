@@ -1,0 +1,139 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  The first real, cross-process ExchangeStore implementation (design doc sec 14 Phase 3):
+  Apache Celeborn-backed. handleKind/serializeHandle/deserializeHandle/isFresh/
+  checkIdentityIsolation are real, tested against a real Celeborn master's admin REST API.
+  reattach is NOT implemented : vanilla Apache Celeborn's public client API was checked (not
+  assumed) to have no way to read a shuffle registered under a DIFFERENT application's identity,
+  which is exactly the Tier 3 "documented backend-patch requirement" design doc sec 8 describes.
+  See CelebornExchangeStore's own doc comment for the full account of what was checked.
+
+  celeborn-openapi-client is the ONLY Celeborn dependency this module needs : the metadata half
+  this phase implements is entirely a REST client against the master's admin API, not the shuffle
+  data-plane client (celeborn-client-spark-3-shaded) a real Spark application already has on its
+  own classpath for its shuffle manager. Depending on the data-plane client here would be pure
+  dead weight for a store that never calls it.
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>org.apache.spark.resume</groupId>
+    <artifactId>spark-resume-parent</artifactId>
+    <version>0.1.0-SNAPSHOT</version>
+  </parent>
+
+  <artifactId>spark-resume-celeborn_2.12</artifactId>
+  <packaging>jar</packaging>
+
+  <properties>
+    <!-- A real, published, vanilla Apache Celeborn release : verified this module's specific
+         gap (no cross-application shuffle read in the public client API) against this exact
+         version's actual bytecode, not assumed from an older release or a private fork. -->
+    <celeborn.version>0.7.0</celeborn.version>
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>org.scala-lang</groupId>
+      <artifactId>scala-library</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.spark.resume</groupId>
+      <artifactId>spark-resume-api_2.12</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.celeborn</groupId>
+      <artifactId>celeborn-openapi-client</artifactId>
+      <version>${celeborn.version}</version>
+    </dependency>
+    <!-- TEST SCOPE ONLY : production code (CelebornExchangeStore itself) never depends on
+         spark-resume-core. Needed to prove SafeReattach.attempt's RefusedUnsupported outcome
+         end-to-end against this real backend, not just unit-test the store in isolation. -->
+    <dependency>
+      <groupId>org.apache.spark.resume</groupId>
+      <artifactId>spark-resume-core_2.12</artifactId>
+      <version>${project.version}</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.scalatest</groupId>
+      <artifactId>scalatest_${scala.binary.version}</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <!-- ExchangeStoreContract, the conformance testkit this module's CelebornExchangeStore is
+         required to pass (with reattachSupported = false, a deliberate documented claim : see
+         that field's doc comment) : see docs/DESIGN.md sec 12. -->
+    <dependency>
+      <groupId>org.apache.spark.resume</groupId>
+      <artifactId>spark-resume-api_2.12</artifactId>
+      <version>${project.version}</version>
+      <type>test-jar</type>
+      <scope>test</scope>
+    </dependency>
+    <!-- TEST SCOPE ONLY : production code never depends on this. The conformance testkit's
+         freshHandle/staleHandle fixtures need a REAL registered shuffle at a real master to test
+         isFresh's positive path honestly, which needs Celeborn's actual data-plane client
+         (LifecycleManager/ShuffleClient, both genuinely engine-agnostic public API, not
+         Spark-specific) to drive one real minimal shuffle registration : see
+         CelebornExchangeStoreSpec. -->
+    <dependency>
+      <groupId>org.apache.celeborn</groupId>
+      <artifactId>celeborn-client-spark-3-shaded_${scala.binary.version}</artifactId>
+      <version>${celeborn.version}</version>
+      <scope>test</scope>
+    </dependency>
+    <!-- The shaded client does NOT bundle slf4j (a real Spark app already provides it) : needed
+         at test scope only, to drive that client directly in tests. -->
+    <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-api</artifactId>
+      <version>2.0.17</version>
+      <scope>test</scope>
+    </dependency>
+    <!-- Also left unshaded, same reasoning as slf4j above : a real Spark app already bundles
+         dropwizard metrics for its own metrics system. -->
+    <dependency>
+      <groupId>io.dropwizard.metrics</groupId>
+      <artifactId>metrics-core</artifactId>
+      <version>4.2.19</version>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <sourceDirectory>src/main/scala</sourceDirectory>
+    <testSourceDirectory>src/test/scala</testSourceDirectory>
+    <plugins>
+      <plugin>
+        <groupId>net.alchim31.maven</groupId>
+        <artifactId>scala-maven-plugin</artifactId>
+      </plugin>
+      <plugin>
+        <groupId>org.scalatest</groupId>
+        <artifactId>scalatest-maven-plugin</artifactId>
+        <configuration>
+          <!-- Same JDK 17 module-opens tax the Spark-dependent modules pay : Celeborn's client
+               shades in Netty, which needs these for direct-buffer/reflective access under 17. -->
+          <argLine>
+            -Xmx2g
+            --add-opens=java.base/java.lang=ALL-UNNAMED
+            --add-opens=java.base/java.lang.invoke=ALL-UNNAMED
+            --add-opens=java.base/java.lang.reflect=ALL-UNNAMED
+            --add-opens=java.base/java.io=ALL-UNNAMED
+            --add-opens=java.base/java.net=ALL-UNNAMED
+            --add-opens=java.base/java.nio=ALL-UNNAMED
+            --add-opens=java.base/java.util=ALL-UNNAMED
+            --add-opens=java.base/java.util.concurrent=ALL-UNNAMED
+            --add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED
+            --add-opens=java.base/jdk.internal.misc=ALL-UNNAMED
+            --add-opens=java.base/sun.nio.ch=ALL-UNNAMED
+          </argLine>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+</project>

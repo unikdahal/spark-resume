@@ -397,6 +397,14 @@ intentionally NOT listed above as an in-tree module in this initial cut — see 
 the first concrete `ExchangeStore` implementation should probably be built and proven as an
 out-of-tree consumer of `spark-resume-api` before deciding whether it belongs in-tree at all.
 
+**Update, Phase 3:** built in-tree directly instead, as `spark-resume-celeborn` (not
+`spark-resume-store-celeborn` — actual module names across this whole section drifted from this
+early design pass during real implementation, same as noted for §6's SPI shapes; take this
+section as original intent, not a current file listing). Appendix B's precondition — the SPI
+proven against the dev-only backend first — was already satisfied by Phase 0's
+`ExchangeStoreContract` + `InMemoryExchangeStore` by the time Phase 3 started, so the
+out-of-tree-first sequencing this paragraph describes did not end up applying.
+
 ## 10. Configuration surface
 
 All configuration is namespaced under `spark.resume.*`, off by default, and every knob has a
@@ -602,9 +610,48 @@ metrics system (a `Source` registered the standard way), not a bespoke reporting
      install` (with Redis running), reproduced clean. It is NOT complete in the sense of "safe to
      depend on for the unpinned-Iceberg-read case" — see the KNOWN GAP just above, which stayed
      open because no public API fix exists at this phase, not because it went unnoticed.
-4. **Phase 3 — first real `ExchangeStore` implementation for a disaggregated shuffle backend**,
-   built and proven as an out-of-tree consumer first (see Appendix B), evaluated for in-tree
-   inclusion only after it has its own independent track record.
+4. **Phase 3 — first real `ExchangeStore` implementation for a disaggregated shuffle backend —
+   underway; the metadata half is done, `reattach` is a confirmed, documented gap, not yet
+   closed.** Built in-tree directly (Appendix B's "prove the SPI against the dev-only backend
+   first" precondition was already satisfied by `ExchangeStoreContract` + `InMemoryExchangeStore`
+   from Phase 0, so the out-of-tree-first sequencing that section describes did not apply here).
+   `spark-resume-celeborn`'s `CelebornExchangeStore`, against vanilla Apache Celeborn `0.7.0` (a
+   real published release, not a private fork): `handleKind`, `serializeHandle`/
+   `deserializeHandle`, `isFresh` (a live query against the master's admin REST API), and
+   `checkIdentityIsolation` are real and tested against a real Celeborn master and worker
+   (`ExchangeStoreContract`'s 8 tests, plus a `SafeReattach.attempt` end-to-end proof against the
+   real cluster). `checkIdentityIsolation` is a genuine, tested closing of a hazard prior work on
+   this idea only ever disclosed, never enforced in code: it refuses `IsolationConflict` when a
+   resuming driver's own `appUniqueId` matches the anchor's producing `appUniqueId`.
+
+   `reattach` throws a documented `UnsupportedOperationException` — Tier 3 exactly as this
+   section's own header describes it, confirmed by checking vanilla Celeborn `0.7.0`'s actual
+   client API (`ShuffleClient`/`LifecycleManager`) rather than assumed: `readPartition`/
+   `registerMapPartitionTask` are scoped to the registering `LifecycleManager`; there is no public
+   method to read a shuffle's committed locations under a different application's identity.
+   `spark-resume-core`'s `SafeReattach` gained a fourth `ReattachOutcome`,
+   `RefusedUnsupported`, specifically because of this: `store.reattach` throwing
+   `UnsupportedOperationException` would otherwise propagate a raw exception out of the ONE
+   enforced choke point every driver-side integration calls `reattach` through, rather than the
+   structured refusal every OTHER gap in that function already produces. A real prior, private,
+   unpublished prototype needed to add exactly this missing capability (non-upstream
+   `LifecycleManager` methods) to make cross-application reattachment work at all — confirmation
+   that vanilla Celeborn genuinely lacks it, not evidence this project failed to find an existing
+   path.
+
+   A real testkit finding surfaced building this: `ExchangeStoreContract`, as originally written,
+   unconditionally required `reattach` to succeed in two of its eight tests — unsatisfiable by an
+   honest Tier 3 implementation. Fixed by adding a `reattachSupported: Boolean = true` hook
+   (default preserves every other implementation's existing behavior), mirroring the contract's
+   existing `conflictingIdentityHandle: Option[...]` pattern for "not every backend has this
+   hazard" — a deliberate documented claim about the backend when overridden, not a shortcut.
+
+   Standing up a real Celeborn cluster for this needed the OFFICIAL binary distribution (Maven
+   Central publishes only the Spark-bundled client and the admin REST client standalone, not the
+   master/worker service jars) — `spark-resume-celeborn/run-celeborn-tests.sh` downloads it once,
+   stands up a local single-master/single-worker cluster, runs the module's tests, and tears down
+   on exit; reproduced clean across 2 consecutive runs from a cold standup. See
+   `spark-resume-celeborn/README.md` for the full account.
 5. **Phase 4 — scale/load validation, multi-fingerprint-provider conformance suite opened to
    external contributors, public 1.0.**
 

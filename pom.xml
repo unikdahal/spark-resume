@@ -34,6 +34,7 @@
     <module>spark-resume-spark-3.5</module>
     <module>spark-resume-iceberg</module>
     <module>spark-resume-redis</module>
+    <module>spark-resume-celeborn</module>
   </modules>
 
   <properties>

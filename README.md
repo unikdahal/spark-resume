@@ -19,24 +19,29 @@ what this project explicitly does *not* attempt to solve.
 
 ## Status
 
-**Phase 0 done, Phase 1 done, Phase 2 done.** `spark-resume-api` (the SPI) + `spark-resume-core`
-(the admission engine, the identity-isolation-safe reattach path) + `spark-resume-spark-3.5`
-(Tier 1 Spark 3.5 integration: real whole-plan AND per-stage fingerprinting, a capture/check
-decision-layer proof against two independent `SparkSession`s at both granularities) +
-`spark-resume-iceberg` (an Iceberg `SourceFingerprint` keyed on the resolved snapshot id) +
-`spark-resume-redis` (the first real, cross-process `AnchorStore`, atomic fencing proven against
-a real Redis server) all build and are tested — 72/72 tests, `mvn clean install` (needs a Redis
-reachable for `spark-resume-redis`'s tests — see that module's README), reproduced clean across
-multiple consecutive full runs. **Still no execution-skip mechanism anywhere in
-this repository**, and Phase 2 shipped with one known, disclosed A-1 gap (a real, confirmed race
-in `spark-resume-iceberg`'s unpinned-read path — see that module's README before depending on it)
-rather than a fully clean bill of health — this project reports gaps it can't yet fix, not just
-the ones it can. The default `FileSourceFingerprint` provider was checked against the same race
-and confirmed NOT vulnerable (see `docs/DESIGN.md` §14 Phase 2) — the gap is Iceberg-specific, not
-architectural. Tier 1 has no public Spark extension point to substitute a stage's previously-
-computed output for real execution; that needs Tier 2/3 (Phase 3+), which do not exist yet. Read
-`spark-resume-spark-3.5/README.md`'s "What this does NOT prove" section before assuming more than
-that. Nothing here should be described as production-ready — see `docs/DESIGN.md` §14 for the
+**Phase 0 done, Phase 1 done, Phase 2 done with one known, disclosed correctness gap, Phase 3
+underway (one real backend done, honestly partial).** `spark-resume-api` (the SPI) +
+`spark-resume-core` (the admission engine, the identity-isolation-safe reattach path) +
+`spark-resume-spark-3.5` (Tier 1 Spark 3.5 integration: real whole-plan AND per-stage
+fingerprinting, a capture/check decision-layer proof against two independent `SparkSession`s at
+both granularities) + `spark-resume-iceberg` (an Iceberg `SourceFingerprint` keyed on the resolved
+snapshot id) + `spark-resume-redis` (the first real, cross-process `AnchorStore`, atomic fencing
+proven against a real Redis server) + `spark-resume-celeborn` (the first real, cross-process
+`ExchangeStore`, against a real vanilla Celeborn cluster) all build and are tested — 90/90 tests,
+`mvn clean install` (needs a real Redis reachable for `spark-resume-redis` and a real Celeborn
+cluster reachable for `spark-resume-celeborn` — see each module's README), reproduced clean across
+multiple consecutive full runs. **Still no execution-skip mechanism anywhere in this repository**,
+and two real, disclosed gaps ship rather than a fully clean bill of health: a confirmed A-1 race in
+`spark-resume-iceberg`'s unpinned-read path (the default `FileSourceFingerprint` provider was
+checked against the same race and confirmed NOT vulnerable — Iceberg-specific, not architectural),
+and `spark-resume-celeborn`'s `reattach` is a documented `UnsupportedOperationException`, not a
+working implementation — vanilla Apache Celeborn's public client API was checked and confirmed to
+have no way to read a shuffle registered under a different application's identity, which is
+`docs/DESIGN.md` §8's Tier 3 exactly as specified, a backend capability gap, not a bug in this
+project's code. This project reports gaps it can't yet fix, not just the ones it can. Read
+`spark-resume-spark-3.5/README.md`'s and `spark-resume-celeborn/README.md`'s "What this does NOT
+prove" sections before assuming more than that. Nothing here should be described as
+production-ready — see `docs/DESIGN.md` §14 for the
 roadmap and what each remaining phase needs to add before that claim would be earned.
 
 ## Repository layout
@@ -63,6 +68,12 @@ spark-resume-redis/       the first real, cross-process AnchorStore: Redis-backe
                            generation fencing (server-side INCR + a Lua compare-and-write script),
                            proven against a real Redis server. Its tests need one running -- see
                            its own README.
+spark-resume-celeborn/    the first real, cross-process ExchangeStore: Apache Celeborn-backed.
+                           The metadata half (handleKind/isFresh/checkIdentityIsolation) is real
+                           against a real cluster; reattach is a documented
+                           UnsupportedOperationException, a checked Tier 3 backend capability gap,
+                           not a bug. Its tests need a real cluster -- run-celeborn-tests.sh stands
+                           one up from the official release. See its own README.
 docs/DESIGN.md             the full architecture design: concepts, invariants, the SPI in depth,
                            the three-tier Spark integration strategy, and the roadmap.
 ```

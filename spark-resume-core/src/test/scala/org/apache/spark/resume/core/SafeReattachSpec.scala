@@ -25,6 +25,19 @@ class CountingExchangeStore(delegate: ExchangeStore) extends ExchangeStore {
   }
 }
 
+/** Delegates everything except `reattach`, which always throws `toThrow` -- for testing what
+  * `SafeReattach.attempt` does with a store whose `reattach` is a documented capability gap (or,
+  * separately, a genuine bug/transient failure). */
+class ThrowingReattachStore(delegate: ExchangeStore, toThrow: => Throwable) extends ExchangeStore {
+  override def handleKind: String = delegate.handleKind
+  override def serializeHandle(handle: ExchangeHandle): Array[Byte] = delegate.serializeHandle(handle)
+  override def deserializeHandle(payload: Array[Byte]): ExchangeHandle = delegate.deserializeHandle(payload)
+  override def isFresh(handle: ExchangeHandle): Boolean = delegate.isFresh(handle)
+  override def checkIdentityIsolation(handle: ExchangeHandle): IsolationResult =
+    delegate.checkIdentityIsolation(handle)
+  override def reattach(handle: ExchangeHandle): ReattachResult = throw toThrow
+}
+
 class SafeReattachSpec extends AnyFunSuite with Matchers {
 
   private def freshResult = ReattachResult(2, 3, Array(10L, 20L, 30L), 100L, Array(0, 0))
@@ -75,5 +88,27 @@ class SafeReattachSpec extends AnyFunSuite with Matchers {
 
     SafeReattach.attempt(spy, handle) shouldBe RefusedStale
     spy.reattachCalls.get() shouldBe 0
+  }
+
+  test("a fresh, isolation-ok handle whose store documents reattach as unsupported (Tier 3 capability gap) -> RefusedUnsupported, not a raw throw") {
+    val inner = new InMemoryExchangeStore
+    val handle = inner.put("h5", freshResult)
+    val throwing = new ThrowingReattachStore(inner, new UnsupportedOperationException("no cross-application read path"))
+
+    SafeReattach.attempt(throwing, handle) match {
+      case RefusedUnsupported(reason) => reason should include("cross-application")
+      case other => fail(s"expected RefusedUnsupported, got $other")
+    }
+  }
+
+  test("a fresh, isolation-ok handle whose store's reattach throws something OTHER than UnsupportedOperationException -> propagates, is NOT swallowed into a refusal") {
+    // A real bug or a transient backend failure (a network timeout, a corrupt record) must not be
+    // folded into the same "this is fine, business as usual" refusal shape as a documented
+    // capability gap -- only UnsupportedOperationException gets that treatment.
+    val inner = new InMemoryExchangeStore
+    val handle = inner.put("h6", freshResult)
+    val throwing = new ThrowingReattachStore(inner, new RuntimeException("transient backend failure"))
+
+    a[RuntimeException] should be thrownBy SafeReattach.attempt(throwing, handle)
   }
 }
