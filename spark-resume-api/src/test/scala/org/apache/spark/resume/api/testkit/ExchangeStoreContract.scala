@@ -91,6 +91,14 @@ abstract class ExchangeStoreContract extends AnyFunSuite with Matchers {
     r1.mapperAttempts.toSeq shouldBe r2.mapperAttempts.toSeq
   }
 
+  test("deserializeHandle rejects a payload this implementation did not produce") {
+    // ExchangeStore.deserializeHandle's contract: "must not silently accept a foreign payload."
+    // Feeding it bytes no real serializeHandle call ever produced must throw, not return a handle
+    // that only fails later (or, worse, one that happens to alias a real handle by coincidence).
+    val store = newStore()
+    a[RuntimeException] should be thrownBy store.deserializeHandle("not a real payload, ever".getBytes("UTF-8"))
+  }
+
   test("handleKind is non-empty and stable across calls") {
     val store = newStore()
     store.handleKind should not be empty

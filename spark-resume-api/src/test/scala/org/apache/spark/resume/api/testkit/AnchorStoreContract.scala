@@ -38,9 +38,14 @@ abstract class AnchorStoreContract extends AnyFunSuite with Matchers {
       rowCount = 1L,
       createdAtMs = System.currentTimeMillis())
 
-  test("acquireGeneration starts at a value greater than any never-acquired default and is monotonic") {
+  test("acquireGeneration's first value is distinguishable from a never-acquired queryId, and it is monotonic") {
     val store = newStore()
     val g1 = store.acquireGeneration("q1")
+    // 0 is the conventional "never written" sentinel a fence-gated putAnchor check would compare
+    // against for a queryId nothing has called acquireGeneration for yet -- the first real
+    // generation must not collide with it, or a caller could not tell "never acquired" apart from
+    // "acquired once."
+    g1 should be > 0L
     val g2 = store.acquireGeneration("q1")
     val g3 = store.acquireGeneration("q1")
     g2 should be > g1

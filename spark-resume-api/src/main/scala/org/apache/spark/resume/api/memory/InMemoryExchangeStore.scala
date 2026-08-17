@@ -26,13 +26,25 @@ final class InMemoryExchangeStore extends ExchangeStore {
 
   override def handleKind: String = "in-memory"
 
+  // A fixed magic prefix, not just the raw id -- so deserializeHandle can actually tell a foreign
+  // payload apart from one of its own, per ExchangeStore.deserializeHandle's contract ("must not
+  // silently accept a foreign payload"). Bare bytes with no tag would make every payload look
+  // like a valid id, which is exactly the silent-acceptance failure that contract forbids.
+  private val Magic = "IMH1:"
+
   override def serializeHandle(handle: ExchangeHandle): Array[Byte] = handle match {
-    case InMemoryHandle(id) => id.getBytes("UTF-8")
+    case InMemoryHandle(id) => (Magic + id).getBytes("UTF-8")
     case other => throw new IllegalArgumentException(s"not an InMemoryHandle: $other")
   }
 
-  override def deserializeHandle(payload: Array[Byte]): ExchangeHandle =
-    InMemoryHandle(new String(payload, "UTF-8"))
+  override def deserializeHandle(payload: Array[Byte]): ExchangeHandle = {
+    val text = new String(payload, "UTF-8")
+    if (!text.startsWith(Magic)) {
+      throw new IllegalArgumentException(
+        s"payload was not produced by InMemoryExchangeStore (missing '$Magic' tag)")
+    }
+    InMemoryHandle(text.stripPrefix(Magic))
+  }
 
   /** Test/dev-only registration -- a real backend's equivalent is whatever committed the data in
     * the first place, not a method on the store interface itself (which is why this isn't part
