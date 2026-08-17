@@ -1,17 +1,21 @@
 # Design: a generic shuffle/stage resumption library for Apache Spark
 
 Status: **Phase 0, Phase 1, and Phase 2 done; Phase 3 underway** (one real backend done, honestly
-partial), with two known, disclosed gaps — an A-1 race in the Iceberg provider's unpinned-read
-path (§14 Phase 2) and a documented Tier 3 backend-capability gap in `spark-resume-celeborn`'s
-`reattach` (§14 Phase 3). `spark-resume-api` (the SPI), `spark-resume-core` (the admission engine +
-the identity-isolation-safe reattach path, now with a fourth `ReattachOutcome`,
-`RefusedUnsupported`), `spark-resume-spark-3.5` (Tier 1 Spark integration: whole-plan AND per-stage
-fingerprinting, capture, and admission-check, proven across two independent `SparkSession`s),
-`spark-resume-iceberg` (an Iceberg `SourceFingerprint`), `spark-resume-redis` (a real, cross-process
-`AnchorStore`), and `spark-resume-celeborn` (a real, cross-process `ExchangeStore`'s metadata half)
-are all built and tested — 90/90 tests, reproduced clean across multiple full runs (needs a real
-Redis and a real Celeborn cluster reachable — see each module's README), see the repo root README
-and each module's own README. Still no execution-skip mechanism anywhere (Phase 3+, Tier 2/3). This document
+partial, plus a real cross-process composition proof), with two known, disclosed gaps — an A-1
+race in the Iceberg provider's unpinned-read path (§14 Phase 2) and a documented Tier 3
+backend-capability gap in `spark-resume-celeborn`'s `reattach` (§14 Phase 3). `spark-resume-api`
+(the SPI), `spark-resume-core` (the admission engine + the identity-isolation-safe reattach path,
+now with a fourth `ReattachOutcome`, `RefusedUnsupported`), `spark-resume-spark-3.5` (Tier 1 Spark
+integration: whole-plan AND per-stage fingerprinting, capture, and admission-check, proven across
+two independent `SparkSession`s), `spark-resume-iceberg` (an Iceberg `SourceFingerprint`),
+`spark-resume-redis` (a real, cross-process `AnchorStore`), and `spark-resume-celeborn` (a real,
+cross-process `ExchangeStore`'s metadata half) are all built and tested — 90/90 tests, reproduced
+clean across multiple full runs (needs a real Redis and a real Celeborn cluster reachable — see
+each module's README), see the repo root README and each module's own README.
+`spark-resume-integration` (not counted in the 90; deliberately excluded from a bare `mvn install`
+— see §14 Phase 3 and its own README) adds a real TWO-PROCESS proof the whole pipeline composes
+against real backends, terminating in the same disclosed `RefusedUnsupported` gap. Still no
+execution-skip mechanism anywhere (Phase 3+, Tier 2/3). This document
 specifies the architecture for the project as a whole — provisionally named `spark-resume` (see
 Appendix A) — that generalizes a mechanism proven across several proof-of-concept repositories
 into a real, pluggable, production-grade library. It intentionally contains no reference to any
@@ -409,6 +413,13 @@ proven against the dev-only backend first — was already satisfied by Phase 0's
 `ExchangeStoreContract` + `InMemoryExchangeStore` by the time Phase 3 started, so the
 out-of-tree-first sequencing this paragraph describes did not end up applying.
 
+**Update, later in Phase 3:** `spark-resume-integration` was added, also not listed above (this
+section predates it entirely) — not a library, not depended on by anything else, no test-jar. It
+exists solely to run a real two-process, cross-backend composition proof (`spark-resume-spark-3.5`
++ `spark-resume-redis` + `spark-resume-celeborn` + `spark-resume-core` together, against real
+backends) that no isolated per-module test suite could provide — see §14's Phase 3 entry and
+`spark-resume-integration/README.md`.
+
 ## 10. Configuration surface
 
 All configuration is namespaced under `spark.resume.*`, off by default, and every knob has a
@@ -655,6 +666,38 @@ metrics system (a `Source` registered the standard way), not a bespoke reporting
    stands up a local single-master/single-worker cluster, runs the module's tests, and tears down
    on exit; reproduced clean across 2 consecutive runs from a cold standup. See
    `spark-resume-celeborn/README.md` for the full account.
+
+   **Update, later in Phase 3: `spark-resume-integration`, a real cross-process, cross-backend
+   composition proof.** Every module through this point is proven only in isolation against its
+   own real backend — nothing proved `spark-resume-spark-3.5`'s capture path writes an anchor a
+   SECOND, separate driver process can read back, resolve to a `CelebornHandle`, and run through
+   `AdmissionEngine` + `SafeReattach` against the real Celeborn master. `spark-resume-integration`
+   closes that gap: `ProcessA` (a real `SparkSession`, a real shuffle, a real Celeborn shuffle
+   registration, a real anchor written to a real Redis) and `ProcessB` (a fresh JVM, a fresh
+   `SparkSession`, reading that anchor back, running `StageAdmissionCheck`, and calling
+   `SafeReattach.attempt` for the `Admitted` stage) are each their OWN `mvn test -Dsuites=...`
+   invocation — a genuine OS process boundary, not two specs sharing one JVM, since a single JVM
+   would prove nothing about the cross-process durability this whole project exists for.
+
+   The terminal outcome is `RefusedUnsupported`, asserted explicitly — the honest end state this
+   pipeline reaches today. This is stronger evidence than three modules each passing alone: it
+   proves everything up to the backend byte-read composes correctly across real processes, and
+   that the one thing that doesn't work is exactly, and only, the already-disclosed Tier 3 gap —
+   not a silent success, and not a raw crash either.
+
+   A real seam had to be bridged, not glossed over: `ExchangeStore` has no producer-side "issue me
+   a handle" method (every method on that trait is a resuming-driver operation), so
+   `StageCaptureListener` (Phase 2, unchanged) is correct to always write the `NoHandleKind`
+   sentinel — it has no way to know what Celeborn shuffle id a Spark shuffle stage maps to.
+   `ProcessA` builds the real `CelebornHandle` itself instead, exactly as an operator manually
+   wiring these two systems together today would have to; closing this gap for real (a
+   producer-side SPI method, or wiring `spark-resume-spark-3.5` to a specific shuffle manager's id
+   scheme) is a real design decision left for a future phase, disclosed as such rather than
+   quietly assumed away. See `spark-resume-integration/README.md` for the full account, including
+   a real debugging note: a first attempt running `ProcessA`/`ProcessB` as hand-rolled `java -cp`
+   processes hit an unexplained JPMS `IllegalAccessError` inconsistent with every other real
+   `SparkSession` in this repo; rather than chase that discrepancy, both were wrapped as thin
+   scalatest specs run via `scalatest-maven-plugin`'s already-proven forking instead.
 5. **Phase 4 — scale/load validation, multi-fingerprint-provider conformance suite opened to
    external contributors, public 1.0.**
 

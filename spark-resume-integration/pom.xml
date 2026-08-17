@@ -1,0 +1,154 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Cross-process, cross-backend composition proof (design doc sec 14): no test anywhere else in
+  this repo drives spark-resume-spark-3.5, spark-resume-redis, and spark-resume-celeborn together
+  through one real scenario : every module up to this point is proven only in isolation against
+  its own real backend. This module runs two SEPARATE JVM processes (ProcessA, ProcessB; see
+  run-integration-test.sh, not a single scalatest suite : a single JVM proves nothing about
+  cross-process durability, the whole point) against a real Redis and a real Celeborn cluster.
+
+  Not a library: this module is never depended on by anything else, has no test-jar, and is not
+  meant to be published. It exists solely to run ProcessA/ProcessB as standalone Java processes.
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>org.apache.spark.resume</groupId>
+    <artifactId>spark-resume-parent</artifactId>
+    <version>0.1.0-SNAPSHOT</version>
+  </parent>
+
+  <artifactId>spark-resume-integration_2.12</artifactId>
+  <packaging>jar</packaging>
+
+  <properties>
+    <spark.version>3.5.9</spark.version>
+    <celeborn.version>0.7.0</celeborn.version>
+    <!-- Own property, not the generic `skipTests`/`maven.test.skip` : those are special-cased
+         and read by other plugins (surefire, this module's own scala-maven-plugin testCompile)
+         too, in ways that would make a bare `-DskipTests=false` reach further than intended.
+         Defaults to skipped (see the scalatest-maven-plugin execution below for why) and is
+         overridden ONLY by run-integration-test.sh's explicit
+         `-Dspark.resume.integration.skipTests=false -Dsuites=...` per process. -->
+    <spark.resume.integration.skipTests>true</spark.resume.integration.skipTests>
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>org.scala-lang</groupId>
+      <artifactId>scala-library</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.spark.resume</groupId>
+      <artifactId>spark-resume-api_2.12</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.spark.resume</groupId>
+      <artifactId>spark-resume-core_2.12</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.spark.resume</groupId>
+      <artifactId>spark-resume-spark-3.5_2.12</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.spark.resume</groupId>
+      <artifactId>spark-resume-redis_2.12</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.spark.resume</groupId>
+      <artifactId>spark-resume-celeborn_2.12</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.spark</groupId>
+      <artifactId>spark-core_2.12</artifactId>
+      <version>${spark.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.spark</groupId>
+      <artifactId>spark-sql_2.12</artifactId>
+      <version>${spark.version}</version>
+    </dependency>
+    <!-- ProcessA registers one real Celeborn shuffle itself (same data-plane client
+         spark-resume-celeborn's OWN test fixtures use), same reasoning as that module's pom:
+         compile-scope here rather than test-scope because this module's src/main IS the harness,
+         not a test suite around a library. -->
+    <dependency>
+      <groupId>org.apache.celeborn</groupId>
+      <artifactId>celeborn-client-spark-3-shaded_${scala.binary.version}</artifactId>
+      <version>${celeborn.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-api</artifactId>
+      <version>2.0.17</version>
+    </dependency>
+    <dependency>
+      <groupId>io.dropwizard.metrics</groupId>
+      <artifactId>metrics-core</artifactId>
+      <version>4.2.19</version>
+    </dependency>
+    <dependency>
+      <groupId>org.scalatest</groupId>
+      <artifactId>scalatest_${scala.binary.version}</artifactId>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <sourceDirectory>src/main/scala</sourceDirectory>
+    <testSourceDirectory>src/test/scala</testSourceDirectory>
+    <plugins>
+      <plugin>
+        <groupId>net.alchim31.maven</groupId>
+        <artifactId>scala-maven-plugin</artifactId>
+      </plugin>
+      <!-- ProcessASpec/ProcessBSpec are thin wrappers around ProcessA.main/ProcessB.main : see
+           those specs' doc comments for why each is run via its OWN `mvn test -Dsuites=...`
+           invocation (run-integration-test.sh), never both together, and why that (not a
+           hand-rolled `java -cp` invocation) is this module's real process boundary. Same
+           JDK 17 argLine as spark-resume-spark-3.5's pom (a real local SparkSession needs it) plus
+           spark-resume-celeborn's Netty opens (ProcessA drives the real Celeborn data-plane
+           client directly). -->
+      <plugin>
+        <groupId>org.scalatest</groupId>
+        <artifactId>scalatest-maven-plugin</artifactId>
+        <configuration>
+          <!-- Skipped by default : a bare `mvn test`/`install` at the repo root discovers BOTH
+               ProcessASpec and ProcessBSpec and runs them together in ONE JVM, which is exactly
+               the anti-pattern this module's whole design exists to avoid (see those specs' doc
+               comments) : it would also fail outright anyway (INTEGRATION_QUERY_ID unset,
+               real backends possibly unreachable). run-integration-test.sh overrides this with
+               `-Dspark.resume.integration.skipTests=false -Dsuites=...` per process, one `mvn`
+               invocation each, which is the ONLY supported way to run this module's tests. -->
+          <skipTests>${spark.resume.integration.skipTests}</skipTests>
+          <argLine>
+            -Xmx2g
+            --add-opens=java.base/java.lang=ALL-UNNAMED
+            --add-opens=java.base/java.lang.invoke=ALL-UNNAMED
+            --add-opens=java.base/java.lang.reflect=ALL-UNNAMED
+            --add-opens=java.base/java.io=ALL-UNNAMED
+            --add-opens=java.base/java.net=ALL-UNNAMED
+            --add-opens=java.base/java.nio=ALL-UNNAMED
+            --add-opens=java.base/java.util=ALL-UNNAMED
+            --add-opens=java.base/java.util.concurrent=ALL-UNNAMED
+            --add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED
+            --add-opens=java.base/jdk.internal.misc=ALL-UNNAMED
+            --add-opens=java.base/sun.nio.ch=ALL-UNNAMED
+            --add-opens=java.base/sun.nio.cs=ALL-UNNAMED
+            --add-opens=java.base/sun.security.action=ALL-UNNAMED
+            --add-opens=java.base/sun.util.calendar=ALL-UNNAMED
+            --add-opens=java.security.jgss/sun.security.krb5=ALL-UNNAMED
+          </argLine>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+</project>
