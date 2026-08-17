@@ -120,14 +120,14 @@ class StageFingerprintSpec extends SparkTestBase {
   }
 
   test("two structurally IDENTICAL, independently-materialized exchanges over the same source produce the SAME digest -- a real, reasoned-safe collision, not a bug") {
-    withNewSession() { spark =>
-      // Exchange reuse (Spark's own ReuseExchange rule) is disabled specifically so Spark
-      // actually materializes BOTH branches independently instead of deduplicating them itself
-      // -- with reuse left on (the default), Spark's final plan wraps the second occurrence in a
-      // ReusedExchange node, which is structurally different from a plain Exchange and would
-      // never collide with the first one's digest, masking the scenario this test exists to
-      // exercise. Found by running it both ways, not assumed.
-      spark.conf.set("spark.sql.exchange.reuse", "false")
+    // Exchange reuse (Spark's own ReuseExchange rule) is disabled at SESSION-BUILD time
+    // (not via spark.conf.set after the fact, to make the scoping to this one session
+    // unambiguous) specifically so Spark actually materializes BOTH branches independently
+    // instead of deduplicating them itself -- with reuse left on (the default), Spark's final
+    // plan wraps the second occurrence in a ReusedExchange node, which is structurally different
+    // from a plain Exchange and would never collide with the first one's digest, masking the
+    // scenario this test exists to exercise. Found by running it both ways, not assumed.
+    withNewSession(extraConf = Map("spark.sql.exchange.reuse" -> "false")) { spark =>
       import spark.implicits._
       val dir = tmpDir.resolve("union-t1").toString
       Seq((1, "a"), (2, "b"), (3, "a")).toDF("id", "v").write.mode("overwrite").parquet(dir)

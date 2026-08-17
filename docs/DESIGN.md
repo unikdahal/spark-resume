@@ -5,7 +5,7 @@ provider's unpinned-read path — see §14 Phase 2). `spark-resume-api` (the SPI
 (the admission engine + the identity-isolation-safe reattach path), `spark-resume-spark-3.5` (Tier
 1 Spark integration: whole-plan AND per-stage fingerprinting, capture, and admission-check, proven
 across two independent `SparkSession`s), `spark-resume-iceberg` (an Iceberg `SourceFingerprint`),
-and `spark-resume-redis` (a real, cross-process `AnchorStore`) are all built and tested — 71/71
+and `spark-resume-redis` (a real, cross-process `AnchorStore`) are all built and tested — 72/72
 tests, reproduced clean across multiple full runs (Redis running), see the repo root README and
 each module's own README. Still no execution-skip mechanism (Phase 3+, Tier 2/3). This document
 specifies the architecture for the project as a whole — provisionally named `spark-resume` (see
@@ -569,7 +569,17 @@ metrics system (a `Source` registered the standard way), not a bespoke reporting
      fingerprint BEFORE execution rather than after, a capture-architecture change beyond this
      provider's own scope. `VERSION AS OF`-pinned reads are unaffected. See
      `spark-resume-iceberg/README.md` and `IcebergFingerprintProvider`'s doc comment for the full
-     account.
+     account. **Checked whether the DEFAULT provider has the same hole, not left as an inference:**
+     `FileSourceFingerprint` (`spark-resume-spark-3.5`) was confirmed NOT vulnerable to this same
+     race, by running the identical experiment — the same `FileSourceScanExec` node, fingerprinted
+     before and after an on-disk overwrite with no re-plan in between, returns the SAME fingerprint
+     both times (`FileSourceFingerprintSpec`'s dedicated "A-1 SAFETY" test), because
+     `InMemoryFileIndex`'s file listing is fixed at plan time, not live-refreshing the way
+     Iceberg's `Table` handle is — corroborated by the fact that actually executing against the
+     stale plan after such an overwrite fails outright (`FileNotFoundException`, since the exact
+     part-files it was planned against are gone) rather than silently reading the new data. This
+     gap is confirmed Iceberg-connector-specific, not a property of this project's capture
+     architecture in general.
    - **Redis anchor store — DONE, in the new `spark-resume-redis` module
      (`RedisAnchorStore`/`AnchorCodec`).** The first real, cross-process `AnchorStore`
      implementation — durable and visible to a genuinely different driver process, which is the
@@ -588,7 +598,7 @@ metrics system (a `Source` registered the standard way), not a bespoke reporting
      one-line podman command.
    - **Phase 2 is now complete** in the sense of "built and tested with real infrastructure, real
      bugs found and either fixed or disclosed": per-stage fingerprinting, an Iceberg fingerprint
-     provider, and a real cross-process anchor store. 71/71 tests across the repo, `mvn clean
+     provider, and a real cross-process anchor store. 72/72 tests across the repo, `mvn clean
      install` (with Redis running), reproduced clean. It is NOT complete in the sense of "safe to
      depend on for the unpinned-Iceberg-read case" — see the KNOWN GAP just above, which stayed
      open because no public API fix exists at this phase, not because it went unnoticed.

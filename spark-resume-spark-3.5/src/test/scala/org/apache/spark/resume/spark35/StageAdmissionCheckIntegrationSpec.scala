@@ -60,8 +60,7 @@ class StageAdmissionCheckIntegrationSpec extends SparkTestBase {
     val anchorStore = new InMemoryAnchorStore
     val queryId = "q-stage-collision"
 
-    withNewSession() { spark =>
-      spark.conf.set("spark.sql.exchange.reuse", "false") // see StageFingerprintSpec for why
+    withNewSession(extraConf = Map("spark.sql.exchange.reuse" -> "false")) { spark => // see StageFingerprintSpec for why
       import spark.implicits._
       val dir = tmpDir.resolve("stage-e2e-collision").toString
       Seq((1, "a"), (2, "b"), (3, "a")).toDF("id", "v").write.mode("overwrite").parquet(dir)
@@ -85,8 +84,7 @@ class StageAdmissionCheckIntegrationSpec extends SparkTestBase {
     val stored = anchorStore.loadAnchors(StageCaptureListener.stageQueryId(queryId))
     stored should have size 1
 
-    val decisions = withNewSession() { spark =>
-      spark.conf.set("spark.sql.exchange.reuse", "false")
+    val decisions = withNewSession(extraConf = Map("spark.sql.exchange.reuse" -> "false")) { spark =>
       val q = spark.read.parquet(tmpDir.resolve("stage-e2e-collision").toString).groupBy("v").count()
       StageAdmissionCheck.check(q.union(q).queryExecution, queryId, anchorStore, DefaultProviders.all)
     }

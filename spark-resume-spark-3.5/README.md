@@ -12,9 +12,22 @@ scope.
 admission decision — `Admitted` for the identical query, `Rejected` for a structurally different
 one, and (the go/no-go case) `Rejected` when the underlying file was mutated between capture and
 check, not silently admitted. `StageAdmissionCheckIntegrationSpec` proves the same claim at
-per-stage granularity (see below). 71 tests across the whole repo, `mvn clean install`, reproduced
+per-stage granularity (see below). 72 tests across the whole repo, `mvn clean install`, reproduced
 clean across multiple consecutive full runs (see the async-listener-bus bug below for why rerun
 count mattered here).
+
+## Checked for the same hole `spark-resume-iceberg` was found to have
+
+`spark-resume-iceberg`'s `IcebergFingerprintProvider` was found to have a real, confirmed A-1 gap:
+the same scan node returns a NEWER snapshot id if asked again post-execution after a commit lands
+in between, because its underlying `Table` handle auto-refreshes live. `FileSourceFingerprint` was
+checked against the identical scenario, not assumed safe by analogy — confirmed NOT vulnerable
+(`FileSourceFingerprintSpec`'s "A-1 SAFETY" test): the same `FileSourceScanExec` node fingerprints
+identically before and after an on-disk overwrite with no re-plan in between, because
+`InMemoryFileIndex`'s file listing is fixed at plan time, not live-refreshing. Corroborated, not
+just asserted: actually executing against the stale plan after such an overwrite fails outright
+(parquet's own `FileNotFoundException`, since the exact part-files planned against are gone)
+rather than silently reading the new data.
 
 ## Per-stage fingerprinting (`StageFingerprint` / `StageCaptureListener` / `StageAdmissionCheck`)
 

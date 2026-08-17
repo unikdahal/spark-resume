@@ -116,4 +116,38 @@ class FileSourceFingerprintSpec extends SparkTestBase {
       fp2024a shouldBe fp2024b
     }
   }
+
+  test("A-1 SAFETY, confirmed NOT vulnerable to Iceberg's live-refresh race: the SAME scan node fingerprints identically before and after an on-disk overwrite") {
+    // IcebergFingerprintProvider was found to have a real, confirmed A-1 gap here: the identical
+    // BatchScanExec/SparkTable object returns a DIFFERENT (newer) snapshot id when asked again
+    // post-execution, because its underlying Table handle auto-refreshes live. The obvious
+    // question this raised: does FileSourceFingerprint -- the DEFAULT provider everyone uses --
+    // have the same hole? Checked directly rather than left as an inference.
+    withNewSession() { spark =>
+      val dir = tmpDir.resolve("filerace").toString
+      writeParquet(spark, dir, Seq((1, "a"), (2, "b")))
+      val df = spark.read.parquet(dir)
+      val scan = df.queryExecution.executedPlan.collectLeaves()
+        .collectFirst { case f: FileSourceScanExec => f }
+        .getOrElse(fail("no FileSourceScanExec found"))
+      val fpBefore = provider.fingerprint(SparkPlanTarget(scan))
+
+      // A materially different overwrite -- content, length, AND the underlying part-file names
+      // themselves all change (parquet "overwrite" deletes and rewrites, it does not patch
+      // in place).
+      writeParquet(spark, dir, Seq((1, "a"), (2, "b"), (3, "c"), (4, "d"), (5, "e")))
+
+      // Same node OBJECT, asked again -- no new plan, no collect(). If FileSourceScanExec's
+      // FileIndex re-listed storage live the way Iceberg's Table handle does, this would now
+      // differ from fpBefore despite being the identical scan.
+      val fpAfter = provider.fingerprint(SparkPlanTarget(scan))
+      fpBefore shouldBe fpAfter
+
+      // Confirms WHY, not just that: the file paths this scan was planned against are gone after
+      // the overwrite (parquet overwrite renames, doesn't patch), so an actual execution against
+      // this stale plan fails outright rather than silently reading new data -- corroborating
+      // that FileSourceScanExec's InMemoryFileIndex is fixed at plan time, not live-refreshing.
+      an[Exception] should be thrownBy df.collect()
+    }
+  }
 }

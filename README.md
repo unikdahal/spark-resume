@@ -25,14 +25,16 @@ what this project explicitly does *not* attempt to solve.
 decision-layer proof against two independent `SparkSession`s at both granularities) +
 `spark-resume-iceberg` (an Iceberg `SourceFingerprint` keyed on the resolved snapshot id) +
 `spark-resume-redis` (the first real, cross-process `AnchorStore`, atomic fencing proven against
-a real Redis server) all build and are tested — 71/71 tests, `mvn clean install` (needs a Redis
+a real Redis server) all build and are tested — 72/72 tests, `mvn clean install` (needs a Redis
 reachable for `spark-resume-redis`'s tests — see that module's README), reproduced clean across
 multiple consecutive full runs. **Still no execution-skip mechanism anywhere in
 this repository**, and Phase 2 shipped with one known, disclosed A-1 gap (a real, confirmed race
 in `spark-resume-iceberg`'s unpinned-read path — see that module's README before depending on it)
 rather than a fully clean bill of health — this project reports gaps it can't yet fix, not just
-the ones it can. — Tier 1 has no public Spark extension point to substitute a stage's previously-
-computed output for real execution; that needs Tier 2/3 (Phase 2+), which do not exist yet. Read
+the ones it can. The default `FileSourceFingerprint` provider was checked against the same race
+and confirmed NOT vulnerable (see `docs/DESIGN.md` §14 Phase 2) — the gap is Iceberg-specific, not
+architectural. Tier 1 has no public Spark extension point to substitute a stage's previously-
+computed output for real execution; that needs Tier 2/3 (Phase 3+), which do not exist yet. Read
 `spark-resume-spark-3.5/README.md`'s "What this does NOT prove" section before assuming more than
 that. Nothing here should be described as production-ready — see `docs/DESIGN.md` §14 for the
 roadmap and what each remaining phase needs to add before that claim would be earned.
