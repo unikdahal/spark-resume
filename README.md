@@ -19,14 +19,15 @@ what this project explicitly does *not* attempt to solve.
 
 ## Status
 
-**Phase 0 done, Phase 1 done, Phase 2 in progress (per-stage fingerprinting done; Iceberg
-fingerprint provider done; Redis anchor store not yet built).** `spark-resume-api` (the SPI) +
-`spark-resume-core` (the admission engine, the identity-isolation-safe reattach path) +
-`spark-resume-spark-3.5` (Tier 1 Spark 3.5 integration: real whole-plan AND per-stage
-fingerprinting, a capture/check decision-layer proof against two independent `SparkSession`s at
-both granularities) + `spark-resume-iceberg` (an Iceberg `SourceFingerprint` keyed on the
-resolved snapshot id) all build and are tested — 55/55 tests, `mvn clean install`, reproduced
-clean across multiple consecutive full runs. **Still no execution-skip mechanism anywhere in
+**Phase 0 done, Phase 1 done, Phase 2 done.** `spark-resume-api` (the SPI) + `spark-resume-core`
+(the admission engine, the identity-isolation-safe reattach path) + `spark-resume-spark-3.5`
+(Tier 1 Spark 3.5 integration: real whole-plan AND per-stage fingerprinting, a capture/check
+decision-layer proof against two independent `SparkSession`s at both granularities) +
+`spark-resume-iceberg` (an Iceberg `SourceFingerprint` keyed on the resolved snapshot id) +
+`spark-resume-redis` (the first real, cross-process `AnchorStore`, atomic fencing proven against
+a real Redis server) all build and are tested — 65/65 tests, `mvn clean install` (needs a Redis
+reachable for `spark-resume-redis`'s tests — see that module's README), reproduced clean across
+multiple consecutive full runs. **Still no execution-skip mechanism anywhere in
 this repository** — Tier 1 has no public Spark extension point to substitute a stage's previously-
 computed output for real execution; that needs Tier 2/3 (Phase 2+), which do not exist yet. Read
 `spark-resume-spark-3.5/README.md`'s "What this does NOT prove" section before assuming more than
@@ -53,6 +54,10 @@ spark-resume-spark-3.5/   Tier 1 Spark 3.5 integration: real physical-plan finge
 spark-resume-iceberg/     an Iceberg SourceFingerprint keyed on the resolved snapshot id, not a
                            file listing. A separate module so a user without Iceberg on their
                            classpath never pulls it in. See its own README.
+spark-resume-redis/       the first real, cross-process AnchorStore: Redis-backed, atomic
+                           generation fencing (server-side INCR + a Lua compare-and-write script),
+                           proven against a real Redis server. Its tests need one running -- see
+                           its own README.
 docs/DESIGN.md             the full architecture design: concepts, invariants, the SPI in depth,
                            the three-tier Spark integration strategy, and the roadmap.
 ```

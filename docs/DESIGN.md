@@ -529,7 +529,25 @@ metrics system (a `Source` registered the standard way), not a bespoke reporting
      `spark-resume-spark-3.5`, deliberately not referenced by `DefaultProviders.all`, so a user
      without Iceberg on their classpath never risks a `NoClassDefFoundError`. See
      `spark-resume-iceberg/README.md` for the full account.
-   - Redis anchor store — remaining, not yet built.
+   - **Redis anchor store — DONE, in the new `spark-resume-redis` module
+     (`RedisAnchorStore`/`AnchorCodec`).** The first real, cross-process `AnchorStore`
+     implementation — durable and visible to a genuinely different driver process, which is the
+     whole point this project exists for. `acquireGeneration` is Redis's own atomic `INCR`;
+     `putAnchor`'s compare-current-generation-then-write is a Lua script evaluated server-side via
+     `EVAL`, so the check and the write happen as one atomic step rather than a client-side
+     read-then-write race a concurrent writer could interleave with. Proven against a REAL Redis
+     server (not a mock), including `AnchorStoreContract`'s 16-thread concurrent-writer test — the
+     one scenario a non-atomic implementation only fails under genuine pressure. `Anchor`s are
+     encoded via an explicit, versioned, length-prefixed wire format (`AnchorCodec`), not Java
+     serialization, with a dedicated round-trip test that compares every field by CONTENT (`Anchor`
+     is a case class with `Array` fields, whose generated `equals` is reference equality on them —
+     a naive `shouldBe` comparison would silently test the wrong thing). Disclosed: `mvn clean
+     install` at the repo root now requires a real Redis reachable at `REDIS_HOST`/`REDIS_PORT`
+     and fails loudly (not a silent skip) without one — see `spark-resume-redis/README.md` for the
+     one-line podman command.
+   - **Phase 2 is now complete**: per-stage fingerprinting, an Iceberg fingerprint provider, and a
+     real cross-process anchor store all built and tested. 65/65 tests across the repo, `mvn clean
+     install` (with Redis running), reproduced clean across multiple consecutive full runs.
 4. **Phase 3 — first real `ExchangeStore` implementation for a disaggregated shuffle backend**,
    built and proven as an out-of-tree consumer first (see Appendix B), evaluated for in-tree
    inclusion only after it has its own independent track record.

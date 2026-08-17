@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  The first real, cross-process AnchorStore implementation (design doc sec 14 Phase 2):
+  Redis-backed, using server-side INCR for acquireGeneration and a Lua script for putAnchor's
+  compare-and-write, so both fencing operations are genuinely atomic on the Redis server, not a
+  read-then-write race on this client's side. Depends on spark-resume-api ONLY: no Spark
+  dependency at all, since AnchorStore itself has none (see spark-resume-api/pom.xml).
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>org.apache.spark.resume</groupId>
+    <artifactId>spark-resume-parent</artifactId>
+    <version>0.1.0-SNAPSHOT</version>
+  </parent>
+
+  <artifactId>spark-resume-redis_2.12</artifactId>
+  <packaging>jar</packaging>
+
+  <properties>
+    <jedis.version>5.1.0</jedis.version>
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>org.scala-lang</groupId>
+      <artifactId>scala-library</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.spark.resume</groupId>
+      <artifactId>spark-resume-api_2.12</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>redis.clients</groupId>
+      <artifactId>jedis</artifactId>
+      <version>${jedis.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.scalatest</groupId>
+      <artifactId>scalatest_${scala.binary.version}</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <!-- AnchorStoreContract, the conformance testkit this module's RedisAnchorStore is required
+         to pass : see docs/DESIGN.md sec 12. -->
+    <dependency>
+      <groupId>org.apache.spark.resume</groupId>
+      <artifactId>spark-resume-api_2.12</artifactId>
+      <version>${project.version}</version>
+      <type>test-jar</type>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <sourceDirectory>src/main/scala</sourceDirectory>
+    <testSourceDirectory>src/test/scala</testSourceDirectory>
+    <plugins>
+      <plugin>
+        <groupId>net.alchim31.maven</groupId>
+        <artifactId>scala-maven-plugin</artifactId>
+      </plugin>
+      <plugin>
+        <groupId>org.scalatest</groupId>
+        <artifactId>scalatest-maven-plugin</artifactId>
+      </plugin>
+    </plugins>
+  </build>
+</project>

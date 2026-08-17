@@ -33,6 +33,7 @@
     <module>spark-resume-core</module>
     <module>spark-resume-spark-3.5</module>
     <module>spark-resume-iceberg</module>
+    <module>spark-resume-redis</module>
   </modules>
 
   <properties>
