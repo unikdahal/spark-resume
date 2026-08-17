@@ -799,10 +799,15 @@ metrics system (a `Source` registered the standard way), not a bespoke reporting
 - A clear, example-driven README: what problem this solves, a runnable quickstart against the
   in-memory store (so a reader can try it with zero external infrastructure), and a pointer to the
   SPI docs for anyone wanting to plug in their own store or fingerprint provider.
-- `CONTRIBUTING.md` describing the conformance-test requirement (§12) as a hard gate for any new
-  SPI implementation PR, not a suggestion.
-- A public compatibility matrix (Spark line × store implementation × fingerprint provider), kept
-  current by CI rather than by hand.
+- **DONE, Phase 4: `CONTRIBUTING.md`** describing the conformance-test requirement (§12) as a
+  hard gate for any new SPI implementation PR, not a suggestion — including the two hooks
+  (`reattachSupported`, `conflictingIdentityHandle`) that let an honest backend limitation conform
+  without lying about it, and what evidence a PR overriding either needs to show.
+- **DONE, Phase 4, with a disclosed caveat: `docs/COMPATIBILITY.md`**, a public compatibility
+  matrix (Spark line × store implementation × fingerprint provider). Maintained BY HAND, not by
+  CI — there is no CI in this repository yet (see below and `CONTRIBUTING.md`'s own "No CI yet"
+  section), so the matrix is only as current as its last manual update, disclosed as such in the
+  document itself rather than presented as automatically enforced.
 - Every disclosed gap in this document (§2's non-goals, §7's invariants stated as claims this
   project must keep proving, not facts already established) stays visible in the public docs, not
   softened for presentation — the prototypes' own documentation discipline (state exactly what's
@@ -814,9 +819,15 @@ metrics system (a `Source` registered the standard way), not a bespoke reporting
 
 ## 16. Named risks
 
-1. **Tier 2's extension point may never land upstream**, or may land in a materially different
-   shape than proposed here. Mitigated by the Tier 1-only degradation path (§8) always being a
-   complete, if coarser, fallback — this project is useful without Tier 2, not blocked on it.
+1. **Superseded, Phase 4: this risk assumed Tier 2's extension point was a proposal that might
+   never land upstream. It already exists, at Spark 3.5, today** — see §8's correction.
+   `injectQueryStagePrepRule` is documented as present since Spark 3.0, so the risk that remains
+   is narrower: that a FUTURE Spark version changes or removes this hook's timing/semantics
+   without notice, since this project depends on undocumented ordering guarantees (queryStagePrep
+   rules running before `EnsureRequirements`'s validation completes, a leaf substitute surviving
+   `ValidateSparkPlan`) that Spark itself makes no explicit compatibility promise about. Mitigated
+   the same way as before: the Tier 1-only degradation path (§8) is always a complete, if coarser,
+   fallback — this project is useful without stage-level execution-skipping, not blocked on it.
 2. **A third-party `SourceFingerprint` implementation that skips the negative-case conformance
    test could ship a false-positive-resumption bug** (A-1) undetected until it causes silent data
    corruption in someone's production query. Mitigated by making the conformance suite a CI gate

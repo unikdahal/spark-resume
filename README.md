@@ -111,6 +111,10 @@ spark-resume-integration/ not a library: a real TWO-PROCESS proof (ProcessA/Proc
                            the same disclosed RefusedUnsupported gap. See its own README.
 docs/DESIGN.md             the full architecture design: concepts, invariants, the SPI in depth,
                            the three-tier Spark integration strategy, and the roadmap.
+docs/COMPATIBILITY.md      Spark line x store implementation x fingerprint provider, maintained
+                           by hand (no CI yet -- see CONTRIBUTING.md).
+CONTRIBUTING.md            the conformance-testkit requirement as a hard gate for any new SPI
+                           implementation PR, and what evidence a PR is expected to show.
 ```
 
 ## Building
