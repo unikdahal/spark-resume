@@ -17,7 +17,7 @@ across two independent `SparkSession`s reading an unmutated table, a changed fin
 committing `INSERT` (the go/no-go property), discrimination between different tables with
 identical content, correct resolution of a `VERSION AS OF` time-travel read (pinned to the
 snapshot the query actually asked for, not whatever is current later), and the disclosed
-empty-table sentinel for a table with no commits yet. 7 tests, all passing, reproduced clean
+empty-table sentinel for a table with no commits yet. 8 tests, all passing, reproduced clean
 across multiple full `mvn clean install` runs.
 
 ## How the snapshot id is actually reached — a real finding, not a lookup
@@ -41,3 +41,17 @@ Same Tier 1 scope limits as `spark-resume-spark-3.5`: no execution is skipped, t
 only. Untested: reading via a named Iceberg branch (the resolution code path exists and is
 reasoned about in the doc comment, but no test in this suite commits two snapshots to a branch and
 asserts the fingerprint follows the branch's tip rather than staying pinned to the first one).
+
+## KNOWN GAP, NOT FIXED: a real A-1 hazard on the unpinned-read capture path
+
+Confirmed by a dedicated test (`IcebergFingerprintProviderSpec`'s "KNOWN GAP" case), not just
+suspected: the SAME `BatchScanExec`/`SparkTable` object, fingerprinted once right after a query is
+planned and again after it actually executes (with an unrelated `INSERT` committed in between),
+returns a DIFFERENT snapshot id the second time — even though the query itself read the FIRST
+snapshot's data. The real capture path always calls this provider post-execution, so a commit
+landing in that window writes an anchor fingerprinted to data newer than what was actually
+captured — a real false-positive-resumption risk, not a cosmetic edge case. No public Iceberg API
+was found to fix it (the field that IS fixed at scan-build time is package-private; see
+`IcebergFingerprintProvider`'s doc comment for every path that was checked and ruled out). Affects
+unpinned reads only — `VERSION AS OF` pinning is unaffected. Do not treat an anchor from this
+provider as safe against a commit racing the capture listener until this is resolved.

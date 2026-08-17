@@ -1,11 +1,13 @@
 # Design: a generic shuffle/stage resumption library for Apache Spark
 
-Status: **Phase 0 and Phase 1 done.** `spark-resume-api` (the SPI), `spark-resume-core` (the
-admission engine + the identity-isolation-safe reattach path), and `spark-resume-spark-3.5`
-(Tier 1 Spark integration: real-plan fingerprinting, capture, and admission-check, proven across
-two independent `SparkSession`s) are built and tested — 41/41 tests, reproduced clean across 5
-consecutive full runs, see the repo root README and `spark-resume-spark-3.5/README.md`. Still no
-execution-skip mechanism (Phase 2+, Tier 2/3). This document
+Status: **Phase 0, Phase 1, and Phase 2 done** (with a known, disclosed A-1 gap in the Iceberg
+provider's unpinned-read path — see §14 Phase 2). `spark-resume-api` (the SPI), `spark-resume-core`
+(the admission engine + the identity-isolation-safe reattach path), `spark-resume-spark-3.5` (Tier
+1 Spark integration: whole-plan AND per-stage fingerprinting, capture, and admission-check, proven
+across two independent `SparkSession`s), `spark-resume-iceberg` (an Iceberg `SourceFingerprint`),
+and `spark-resume-redis` (a real, cross-process `AnchorStore`) are all built and tested — 71/71
+tests, reproduced clean across multiple full runs (Redis running), see the repo root README and
+each module's own README. Still no execution-skip mechanism (Phase 3+, Tier 2/3). This document
 specifies the architecture for the project as a whole — provisionally named `spark-resume` (see
 Appendix A) — that generalizes a mechanism proven across several proof-of-concept repositories
 into a real, pluggable, production-grade library. It intentionally contains no reference to any
@@ -514,6 +516,33 @@ metrics system (a `Source` registered the standard way), not a bespoke reporting
      content-addressing approach should be unaffected (it reads the shuffle's own write-side stats,
      not the coalesced/split read side), but that is reasoning from the mechanism, not a dedicated
      test, and should get one before this is trusted for a skew-heavy workload.
+
+     What content-addressing does NOT resolve, stated plainly rather than left implicit: AQE
+     re-planning ABOVE an already-materialized stage (e.g. converting a sort-merge join to a
+     broadcast join off runtime stats) produces an upper exchange subtree in the final plan with no
+     counterpart in `initialPlan` at all — its capture-side digest can never be produced on the
+     check side. Fails closed (that stage is simply never matched, per A-2), but it means per-stage
+     adoption reaches only the bottom-most stages of any query AQE re-plans this way, not the whole
+     tree — confirmed narrowly (a join+aggregation query correctly yields 2 check-side candidates
+     but only 1 captured stage, since `StageFingerprint` is deliberately scoped to
+     `ShuffleQueryStageExec` and excludes `BroadcastQueryStageExec` — the broadcast candidate
+     legitimately has no match), not exhaustively (the specific SMJ→BHJ runtime-conversion case
+     above was reasoned about, not forced and observed).
+
+     A second real finding, from deliberately forcing two structurally IDENTICAL exchanges over
+     the same source (`spark.sql.exchange.reuse=false`, so Spark's own `ReuseExchange` rule
+     doesn't merge them first): they DO produce the same digest — a real, reproduced collision, not
+     hypothetical. Reasoned to be benign (a collision under this project's content-addressed scheme
+     implies genuinely interchangeable computations, precisely the condition Spark's own
+     `ReuseExchange` exists to detect), and confirmed end to end (both check-side candidates
+     resolve to `Admitted`, no crash). A secondary finding surfaced by chasing this: whether BOTH
+     same-digest anchors survive a capture is `AnchorStore`-implementation-specific, not part of
+     the interface's contract — `InMemoryAnchorStore` dedupes same-fingerprint writes within one
+     generation (a pre-existing, documented Phase 0 design choice), so only one of the two
+     anchors survives there, while a store that appends (`RedisAnchorStore`'s `RPUSH`) would keep
+     both. Both behaviors are safe for this project's purposes (admission only ever needs ONE
+     matching anchor), so this is noted as a real inter-implementation difference worth knowing
+     about, not a bug to fix.
    - **Iceberg fingerprint provider — DONE, in the new `spark-resume-iceberg` module
      (`IcebergFingerprintProvider`).** Fingerprints a table's resolved Iceberg snapshot id, not a
      file listing — cheaper and exact, since Iceberg's own commit model already provides an
@@ -527,8 +556,20 @@ metrics system (a `Source` registered the standard way), not a bespoke reporting
      branch name is a moving pointer and must never be fingerprinted directly — that would be
      exactly the false-positive-resumption hazard A-1 forbids). A separate module from
      `spark-resume-spark-3.5`, deliberately not referenced by `DefaultProviders.all`, so a user
-     without Iceberg on their classpath never risks a `NoClassDefFoundError`. See
-     `spark-resume-iceberg/README.md` for the full account.
+     without Iceberg on their classpath never risks a `NoClassDefFoundError`. **KNOWN GAP, NOT
+     FIXED, found by a dedicated test rather than assumed safe:** the unpinned-read path (plain
+     `SELECT`, no `VERSION AS OF`) is confirmed to leak a real A-1 hazard — the identical
+     `BatchScanExec`/`SparkTable` object, fingerprinted once at plan time and again after the
+     query executes with an unrelated commit landing in between, returns a DIFFERENT (newer)
+     snapshot id the second time, even though the query itself read the OLDER data. The real
+     capture path always fingerprints post-execution, so a commit racing the listener can write an
+     anchor describing data newer than what was actually captured. No public Iceberg 1.6.1 API
+     was found to fix this (the field that IS fixed at scan-build time is package-private,
+     verified by exhausting the real candidates, not assumed) — mitigating it needs resolving the
+     fingerprint BEFORE execution rather than after, a capture-architecture change beyond this
+     provider's own scope. `VERSION AS OF`-pinned reads are unaffected. See
+     `spark-resume-iceberg/README.md` and `IcebergFingerprintProvider`'s doc comment for the full
+     account.
    - **Redis anchor store — DONE, in the new `spark-resume-redis` module
      (`RedisAnchorStore`/`AnchorCodec`).** The first real, cross-process `AnchorStore`
      implementation — durable and visible to a genuinely different driver process, which is the
@@ -545,9 +586,12 @@ metrics system (a `Source` registered the standard way), not a bespoke reporting
      install` at the repo root now requires a real Redis reachable at `REDIS_HOST`/`REDIS_PORT`
      and fails loudly (not a silent skip) without one — see `spark-resume-redis/README.md` for the
      one-line podman command.
-   - **Phase 2 is now complete**: per-stage fingerprinting, an Iceberg fingerprint provider, and a
-     real cross-process anchor store all built and tested. 65/65 tests across the repo, `mvn clean
-     install` (with Redis running), reproduced clean across multiple consecutive full runs.
+   - **Phase 2 is now complete** in the sense of "built and tested with real infrastructure, real
+     bugs found and either fixed or disclosed": per-stage fingerprinting, an Iceberg fingerprint
+     provider, and a real cross-process anchor store. 71/71 tests across the repo, `mvn clean
+     install` (with Redis running), reproduced clean. It is NOT complete in the sense of "safe to
+     depend on for the unpinned-Iceberg-read case" — see the KNOWN GAP just above, which stayed
+     open because no public API fix exists at this phase, not because it went unnoticed.
 4. **Phase 3 — first real `ExchangeStore` implementation for a disaggregated shuffle backend**,
    built and proven as an out-of-tree consumer first (see Appendix B), evaluated for in-tree
    inclusion only after it has its own independent track record.

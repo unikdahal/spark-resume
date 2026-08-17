@@ -33,11 +33,23 @@ import org.apache.spark.resume.api.{Anchor, AnchorStore}
   * threads, not just documented as safe.
   *
   * Anchor bytes are encoded via [[AnchorCodec]] -- an explicit, versioned wire format, not Java
-  * serialization (see that object's doc comment for why). */
-final class RedisAnchorStore(pool: JedisPool, keyPrefix: String = "spark-resume") extends AnchorStore {
+  * serialization (see that object's doc comment for why).
+  *
+  * `close()` (`java.io.Closeable`) closes the underlying `JedisPool` only when THIS store created
+  * it (the `(host, port[, keyPrefix])` constructors) -- a `JedisPool` passed in directly is
+  * assumed to be owned and lifecycle-managed by the caller (it may be shared with other code),
+  * and this store must never close a resource it didn't create. The `(host, port)` constructors
+  * exist specifically so a caller who doesn't want to think about pool lifecycle at all can still
+  * get one back via `close()` instead of leaking a pool with no way to shut it down. */
+final class RedisAnchorStore private (pool: JedisPool, keyPrefix: String, ownsPool: Boolean)
+    extends AnchorStore with java.io.Closeable {
 
-  def this(host: String, port: Int, keyPrefix: String) = this(new JedisPool(host, port), keyPrefix)
+  def this(pool: JedisPool, keyPrefix: String) = this(pool, keyPrefix, ownsPool = false)
+  def this(pool: JedisPool) = this(pool, "spark-resume", ownsPool = false)
+  def this(host: String, port: Int, keyPrefix: String) = this(new JedisPool(host, port), keyPrefix, ownsPool = true)
   def this(host: String, port: Int) = this(host, port, "spark-resume")
+
+  override def close(): Unit = if (ownsPool) pool.close()
 
   private def genKey(queryId: String): String = s"$keyPrefix:gen:$queryId"
   private def anchorsKey(queryId: String): String = s"$keyPrefix:anchors:$queryId"

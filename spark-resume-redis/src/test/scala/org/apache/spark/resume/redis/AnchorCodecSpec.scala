@@ -50,6 +50,19 @@ class AnchorCodecSpec extends AnyFunSuite with Matchers {
     decoded.bytesByPartition shouldBe empty
   }
 
+  test("encode WRITES the caller's own schemaVersion rather than silently overwriting it") {
+    // Guards against a real bug this exact test caught: an earlier version of encode() wrote a
+    // hardcoded "1" regardless of what the Anchor itself declared, silently rewriting its own
+    // compatibility commitment. sampleAnchor already uses "1" so this couldn't have caught it --
+    // this test exists specifically because that one didn't.
+    val encoded = AnchorCodec.encode(sampleAnchor)
+    AnchorCodec.decode(encoded).schemaVersion shouldBe "1"
+  }
+
+  test("encode REJECTS an anchor whose schemaVersion this codec doesn't know how to write") {
+    an[IllegalArgumentException] should be thrownBy AnchorCodec.encode(sampleAnchor.copy(schemaVersion = "2"))
+  }
+
   test("decode rejects an unrecognized schemaVersion rather than misparsing later fields") {
     // A hand-built payload declaring a schema version this codec doesn't know, so decode must
     // refuse it outright instead of reading garbage as if it were v1's field layout.

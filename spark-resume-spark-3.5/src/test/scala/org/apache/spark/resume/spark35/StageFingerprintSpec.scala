@@ -91,4 +91,62 @@ class StageFingerprintSpec extends SparkTestBase {
       StageFingerprint.capturedStages(df.queryExecution.executedPlan, DefaultProviders.all) shouldBe empty
     }
   }
+
+  test("a join+aggregation query: 2 check-side candidates (shuffle + broadcast exchange), but only 1 captured shuffle stage -- the broadcast one has no match, by design") {
+    withNewSession() { spark =>
+      import spark.implicits._
+      val dir1 = tmpDir.resolve("join-t1").toString
+      val dir2 = tmpDir.resolve("join-t2").toString
+      Seq((1, "a"), (2, "b"), (3, "a")).toDF("id", "v").write.mode("overwrite").parquet(dir1)
+      Seq((1, "x"), (2, "y"), (3, "z")).toDF("id", "w").write.mode("overwrite").parquet(dir2)
+
+      val checkDf = spark.read.parquet(dir1).join(spark.read.parquet(dir2), "id").groupBy("v").count()
+      val candidates = StageFingerprint.checkSideCandidates(checkDf.queryExecution.executedPlan, DefaultProviders.all)
+      // One from the final shuffle (the groupBy), one from the broadcast join build side.
+      candidates should have size 2
+
+      val captureDf = spark.read.parquet(dir1).join(spark.read.parquet(dir2), "id").groupBy("v").count()
+      captureDf.collect()
+      val captured = StageFingerprint.capturedStages(captureDf.queryExecution.executedPlan, DefaultProviders.all)
+      // StageFingerprint is deliberately scoped to ShuffleQueryStageExec only (see its doc
+      // comment) -- the broadcast exchange never becomes a captured stage at all.
+      captured should have size 1
+
+      // The shuffle candidate's digest matches the one real captured stage; the broadcast
+      // candidate's digest legitimately has no match anywhere in captured -- StageAdmissionCheck
+      // must handle that as an ordinary miss (Rejected, no anchor), not a crash or a wrong match.
+      candidates.map(_.digest) should contain(captured.head.digest)
+    }
+  }
+
+  test("two structurally IDENTICAL, independently-materialized exchanges over the same source produce the SAME digest -- a real, reasoned-safe collision, not a bug") {
+    withNewSession() { spark =>
+      // Exchange reuse (Spark's own ReuseExchange rule) is disabled specifically so Spark
+      // actually materializes BOTH branches independently instead of deduplicating them itself
+      // -- with reuse left on (the default), Spark's final plan wraps the second occurrence in a
+      // ReusedExchange node, which is structurally different from a plain Exchange and would
+      // never collide with the first one's digest, masking the scenario this test exists to
+      // exercise. Found by running it both ways, not assumed.
+      spark.conf.set("spark.sql.exchange.reuse", "false")
+      import spark.implicits._
+      val dir = tmpDir.resolve("union-t1").toString
+      Seq((1, "a"), (2, "b"), (3, "a")).toDF("id", "v").write.mode("overwrite").parquet(dir)
+      val q = spark.read.parquet(dir).groupBy("v").count()
+      val df = q.union(q) // the identical subquery, appearing twice
+      df.collect()
+
+      val captured = StageFingerprint.capturedStages(df.queryExecution.executedPlan, DefaultProviders.all)
+      captured should have size 2
+      captured.map(_.digest).distinct should have size 1 // the actual collision, confirmed real
+
+      // Why this is safe rather than a hidden hazard: a digest collision under THIS project's
+      // content-addressed scheme (leaf fingerprints hash actual file identity, not just shape --
+      // see FileSourceFingerprint) can only happen when the two subtrees really did read the same
+      // files through the same operators -- precisely the condition Spark's OWN ReuseExchange
+      // rule exists to detect and physically merge. Two anchors landing under the same digest are
+      // interchangeable records of the same underlying computation, not two different facts
+      // competing for one slot -- StageAdmissionCheck.check picking either one via `.find` is a
+      // reasoned, not accidental, safe choice for this reason.
+    }
+  }
 }

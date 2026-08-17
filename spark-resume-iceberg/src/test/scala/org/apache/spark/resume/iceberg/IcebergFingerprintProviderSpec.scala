@@ -91,6 +91,40 @@ class IcebergFingerprintProviderSpec extends IcebergTestBase {
     }
   }
 
+  test("KNOWN GAP, NOT FIXED: an unpinned read's post-execution fingerprint can drift to a snapshot NEWER than what was actually read") {
+    withNewSession { spark =>
+      spark.sql("CREATE TABLE local.db.t (id INT) USING iceberg")
+      spark.sql("INSERT INTO local.db.t VALUES (1)") // V1
+
+      val df = spark.sql("SELECT * FROM local.db.t") // planned against V1
+      val scan = df.queryExecution.executedPlan.collectLeaves().collectFirst { case b: BatchScanExec => b }
+        .getOrElse(fail("no BatchScanExec found before collect()"))
+      val fpBeforeCollect = new IcebergFingerprintProvider().fingerprint(SparkPlanTarget(scan))
+
+      spark.sql("INSERT INTO local.db.t VALUES (2)") // a NEW commit (V2) lands before df ever executes
+      df.collect() // actually runs the ALREADY-PLANNED df -- reads V1's files, confirmed the same
+                    // BatchScanExec/SparkTable OBJECT before and after (`scanBefore eq scanAfter`,
+                    // `.table eq .table`) by an earlier version of this test
+      val fpAfterCollect = new IcebergFingerprintProvider().fingerprint(SparkPlanTarget(scan))
+
+      // This DELIBERATELY documents the CURRENT, UNSAFE behavior, not the desired one -- see
+      // IcebergFingerprintProvider's doc comment "KNOWN GAP" section for the full account. The
+      // real capture path (SparkResumeListener.onSuccess) calls this provider AFTER collect(),
+      // off the SAME SparkTable object df was planned against. That object's
+      // `table().currentSnapshot()` was found, by running exactly this scenario, to return a
+      // DIFFERENT value after the second INSERT than it did before -- even though nothing about
+      // the object identity changed and the query actually read V1's data. This is a REAL,
+      // CONFIRMED false-positive-resumption hazard (A-1) for the unpinned-read path, not a
+      // capability gap: a capture landing in this race window records an anchor fingerprinted to
+      // a snapshot NEWER than the data it actually captured, which a later check against that
+      // newer snapshot would then wrongly match. If this assertion ever starts FAILING (the two
+      // fingerprints differ), that means the gap has been fixed upstream or by a code change here
+      // -- flip this test back to asserting equality and delete the KNOWN GAP framing when that
+      // happens. Until then, it stays red-documented rather than silently passing on luck.
+      fpBeforeCollect should not be fpAfterCollect
+    }
+  }
+
   test("end-to-end through WholePlanFingerprint.compute: capture then check across two independent sessions") {
     withNewSession { spark =>
       spark.sql("CREATE TABLE local.db.t (id INT, v STRING) USING iceberg")

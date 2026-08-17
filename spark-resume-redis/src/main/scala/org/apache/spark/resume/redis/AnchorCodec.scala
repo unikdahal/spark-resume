@@ -19,9 +19,19 @@ private[redis] object AnchorCodec {
   private val SchemaV1 = "1"
 
   def encode(anchor: Anchor): Array[Byte] = {
+    // Written from the CALLER's own schemaVersion, not a hardcoded constant -- an earlier version
+    // of this method wrote SchemaV1 unconditionally regardless of what anchor.schemaVersion
+    // actually said, which would have silently rewritten an anchor's own declared compatibility
+    // commitment on every encode. Rejected here (fail-closed, A-2) rather than encoded and left
+    // for `decode` to discover later: this codec only knows how to WRITE the v1 layout below, so
+    // an anchor claiming any other version must not be encoded as if it were v1.
+    if (anchor.schemaVersion != SchemaV1) {
+      throw new IllegalArgumentException(
+        s"AnchorCodec: cannot encode schemaVersion '${anchor.schemaVersion}' (only '$SchemaV1' is supported)")
+    }
     val bos = new ByteArrayOutputStream()
     val out = new DataOutputStream(bos)
-    out.writeUTF(SchemaV1)
+    out.writeUTF(anchor.schemaVersion)
     out.writeUTF(anchor.queryId)
     out.writeLong(anchor.generation)
     out.writeUTF(anchor.fingerprint)

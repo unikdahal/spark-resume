@@ -41,7 +41,39 @@ import org.apache.spark.resume.api.{FingerprintTarget, SourceFingerprint}
   *   3. Neither set -- an ordinary unpinned read of the table's main branch -- resolved via
   *      `Table.currentSnapshot()`, read once, at the moment this method is called.
   * A table with no snapshot at all yet (created but never written to) resolves to
-  * [[IcebergFingerprintProvider.EmptyTableSentinel]] rather than crashing or hashing `null`. */
+  * [[IcebergFingerprintProvider.EmptyTableSentinel]] rather than crashing or hashing `null`.
+  *
+  * ==KNOWN GAP, NOT FIXED: the unpinned-read path (resolution step 3) can report a snapshot NEWER
+  * than what was actually read==
+  * Confirmed empirically, not just reasoned about (see `IcebergFingerprintProviderSpec`'s
+  * "KNOWN GAP" test): the same `BatchScanExec`/`SparkTable` OBJECT (verified via `eq`), asked for
+  * its fingerprint twice -- once right after the query was planned, once again after the query
+  * actually executed, with an unrelated `INSERT` committed in between -- returns a DIFFERENT
+  * snapshot id the second time, even though the query's own execution read the FIRST snapshot's
+  * data. `SparkTable.table()`'s underlying `Table` handle auto-refreshes on `currentSnapshot()`
+  * for an unpinned read; it is not a fixed-at-plan-time snapshot the way the query's own file
+  * list is. This matters specifically because the real capture path
+  * ([[org.apache.spark.resume.spark35.SparkResumeListener]]) always calls this provider
+  * POST-execution: a commit landing in the (usually narrow, but real) window between a query
+  * finishing and the listener firing produces an anchor fingerprinted to data NEWER than what was
+  * actually captured -- a genuine false-positive-resumption hazard (invariant A-1), not merely an
+  * untested edge case.
+  *
+  * No public API fix was found, and this was verified by exhausting the real candidates, not by
+  * assumption: `SparkBatchQueryScan.snapshotId()` -- the field that IS fixed at scan-build time,
+  * independent of the table wrapper's live refresh -- is package-private to
+  * `org.apache.iceberg.spark.source`; `SparkInputPartition.table()`/`.taskGroup()` (which would
+  * give the actual resolved file list, another fixed-at-plan-time source) are public METHODS on a
+  * package-private CLASS, unreachable through any public supertype (`InputPartition` declares
+  * neither). Both require reflecting into a third-party connector's internals, which this
+  * project's own public-API-only posture (docs/DESIGN.md §8) rules out doing silently.
+  *
+  * Consequence, stated plainly: do not treat an `IcebergFingerprintProvider`-backed anchor as
+  * safe against a commit racing the capture listener. This is real production-relevant exposure
+  * for the unpinned-read path specifically -- a `VERSION AS OF`-pinned read is unaffected (its
+  * `snapshotId()` is fixed on the object, not re-resolved). Mitigating this properly needs
+  * resolving the fingerprint BEFORE execution rather than after (a capture-architecture change
+  * outside this provider's own scope -- see docs/DESIGN.md §14's Phase 2 Iceberg entry). */
 final class IcebergFingerprintProvider extends SourceFingerprint {
 
   override def supports(target: FingerprintTarget): Boolean = target.node match {

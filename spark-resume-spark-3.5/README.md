@@ -12,7 +12,7 @@ scope.
 admission decision — `Admitted` for the identical query, `Rejected` for a structurally different
 one, and (the go/no-go case) `Rejected` when the underlying file was mutated between capture and
 check, not silently admitted. `StageAdmissionCheckIntegrationSpec` proves the same claim at
-per-stage granularity (see below). 48 tests across the whole repo, `mvn clean install`, reproduced
+per-stage granularity (see below). 71 tests across the whole repo, `mvn clean install`, reproduced
 clean across multiple consecutive full runs (see the async-listener-bus bug below for why rerun
 count mattered here).
 
@@ -28,7 +28,21 @@ for the same end-to-end wiring `AdmissionCheckIntegrationSpec` proves for the wh
 Per-stage anchors carry REAL runtime statistics (`numMappers`/`numPartitions`/`bytesByPartition`,
 straight from `ShuffleExchangeLike` and `MapOutputStatistics`) rather than the whole-query
 listener's placeholders — but are NOT reattachable in this phase (`Anchor.handleKind` is the
-disclosed sentinel `StageCaptureListener.NoHandleKind`; no `ExchangeStore` is wired to them yet).
+disclosed sentinel `StageCaptureListener.NoHandleKind`, enforced two ways: the convenience check
+`StageAdmissionCheck.isReattachable` and, independently, a real `ExchangeStore`'s own
+`deserializeHandle` refusing the sentinel payload outright — proven, not just asserted, in
+`StageAdmissionCheckIntegrationSpec`).
+
+Two things confirmed by deliberately forcing them, not left as untested reasoning: (1) a
+join+aggregation query correctly yields 2 check-side candidates (the shuffle and the broadcast
+exchange) but only 1 captured stage (`StageFingerprint` is deliberately scoped to
+`ShuffleQueryStageExec`; the broadcast candidate legitimately has no match — see `docs/DESIGN.md`
+§14 Phase 2 for what this implies about AQE re-planning above an already-materialized stage); (2)
+two structurally identical exchanges over the same source really do produce the same digest (a
+real, reproduced collision, forced via `spark.sql.exchange.reuse=false` so Spark's own
+`ReuseExchange` rule doesn't merge them first) — reasoned to be benign and confirmed end to end
+(`StageAdmissionCheckIntegrationSpec`), though which store implementation keeps one or both
+same-digest anchors turned out to be implementation-specific (see `docs/DESIGN.md` §14).
 
 ## What this does NOT prove
 
