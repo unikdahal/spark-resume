@@ -1,0 +1,115 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Iceberg fingerprint provider (design doc sec 8, sec 14 Phase 2): a SourceFingerprint that
+  hashes an Iceberg BatchScanExec's resolved snapshot id : not a file listing (that's
+  spark-resume-spark-3.5's FileSourceFingerprint, for the built-in DSv1 file source; Iceberg is a
+  DSv2 connector with its own scan node and its own, cheaper, exact notion of point-in-time table
+  identity : a committed snapshot).
+
+  A separate module from spark-resume-spark-3.5, not folded into it, so a user without Iceberg on
+  their classpath never pulls it in transitively : DefaultProviders in spark-resume-spark-3.5
+  deliberately does not reference this module's provider (see IcebergFingerprintProvider's own
+  doc comment).
+
+  iceberg-spark-runtime is `provided` scope for the same reason spark-core/spark-sql are: a real
+  application supplies its own Iceberg runtime jar to its own classpath; this is a library, not a
+  fat jar.
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>org.apache.spark.resume</groupId>
+    <artifactId>spark-resume-parent</artifactId>
+    <version>0.1.0-SNAPSHOT</version>
+  </parent>
+
+  <artifactId>spark-resume-iceberg_2.12</artifactId>
+  <packaging>jar</packaging>
+
+  <properties>
+    <spark.version>3.5.9</spark.version>
+    <!-- Matches resume-poc-e2e's proven-working version (see that project's pom.xml) rather than
+         picking a fresh one : already cached locally, already known to work against Spark 3.5.9. -->
+    <iceberg.version>1.6.1</iceberg.version>
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>org.scala-lang</groupId>
+      <artifactId>scala-library</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.spark.resume</groupId>
+      <artifactId>spark-resume-api_2.12</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.spark.resume</groupId>
+      <artifactId>spark-resume-spark-3.5_2.12</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.spark</groupId>
+      <artifactId>spark-core_2.12</artifactId>
+      <version>${spark.version}</version>
+      <scope>provided</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.spark</groupId>
+      <artifactId>spark-sql_2.12</artifactId>
+      <version>${spark.version}</version>
+      <scope>provided</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.iceberg</groupId>
+      <artifactId>iceberg-spark-runtime-3.5_${scala.binary.version}</artifactId>
+      <version>${iceberg.version}</version>
+      <scope>provided</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.scalatest</groupId>
+      <artifactId>scalatest_${scala.binary.version}</artifactId>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <sourceDirectory>src/main/scala</sourceDirectory>
+    <testSourceDirectory>src/test/scala</testSourceDirectory>
+    <plugins>
+      <plugin>
+        <groupId>net.alchim31.maven</groupId>
+        <artifactId>scala-maven-plugin</artifactId>
+      </plugin>
+      <plugin>
+        <groupId>org.scalatest</groupId>
+        <artifactId>scalatest-maven-plugin</artifactId>
+        <configuration>
+          <!-- Same JDK 17 module-opens tax as spark-resume-spark-3.5 : see that module's pom.xml
+               comment for why each flag is needed. -->
+          <argLine>
+            -Xmx2g
+            --add-opens=java.base/java.lang=ALL-UNNAMED
+            --add-opens=java.base/java.lang.invoke=ALL-UNNAMED
+            --add-opens=java.base/java.lang.reflect=ALL-UNNAMED
+            --add-opens=java.base/java.io=ALL-UNNAMED
+            --add-opens=java.base/java.net=ALL-UNNAMED
+            --add-opens=java.base/java.nio=ALL-UNNAMED
+            --add-opens=java.base/java.util=ALL-UNNAMED
+            --add-opens=java.base/java.util.concurrent=ALL-UNNAMED
+            --add-opens=java.base/java.util.concurrent.atomic=ALL-UNNAMED
+            --add-opens=java.base/jdk.internal.misc=ALL-UNNAMED
+            --add-opens=java.base/sun.nio.ch=ALL-UNNAMED
+            --add-opens=java.base/sun.nio.cs=ALL-UNNAMED
+            --add-opens=java.base/sun.security.action=ALL-UNNAMED
+            --add-opens=java.base/sun.util.calendar=ALL-UNNAMED
+            --add-opens=java.security.jgss/sun.security.krb5=ALL-UNNAMED
+          </argLine>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+</project>

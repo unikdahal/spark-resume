@@ -514,7 +514,22 @@ metrics system (a `Source` registered the standard way), not a bespoke reporting
      content-addressing approach should be unaffected (it reads the shuffle's own write-side stats,
      not the coalesced/split read side), but that is reasoning from the mechanism, not a dedicated
      test, and should get one before this is trusted for a skew-heavy workload.
-   - Iceberg fingerprint provider, Redis anchor store — remaining, not yet built.
+   - **Iceberg fingerprint provider — DONE, in the new `spark-resume-iceberg` module
+     (`IcebergFingerprintProvider`).** Fingerprints a table's resolved Iceberg snapshot id, not a
+     file listing — cheaper and exact, since Iceberg's own commit model already provides an
+     immutable point-in-time identity. A real finding in reaching it: neither `Scan.description()`
+     nor `Scan.toString()` expose the snapshot id (verified identical before/after a committing
+     INSERT), and the field that does, `SparkBatchQueryScan.snapshotId()`, is package-private —
+     unreachable without reflecting into Iceberg's internals, which this project's public-API-only
+     posture rules out. The path that IS public: `BatchScanExec.table` cast to Iceberg's own
+     public `SparkTable` class, whose `snapshotId()`/`branch()`/`table()` accessors give
+     everything needed, resolved in branch → pinned-snapshot → current-snapshot priority order (a
+     branch name is a moving pointer and must never be fingerprinted directly — that would be
+     exactly the false-positive-resumption hazard A-1 forbids). A separate module from
+     `spark-resume-spark-3.5`, deliberately not referenced by `DefaultProviders.all`, so a user
+     without Iceberg on their classpath never risks a `NoClassDefFoundError`. See
+     `spark-resume-iceberg/README.md` for the full account.
+   - Redis anchor store — remaining, not yet built.
 4. **Phase 3 — first real `ExchangeStore` implementation for a disaggregated shuffle backend**,
    built and proven as an out-of-tree consumer first (see Appendix B), evaluated for in-tree
    inclusion only after it has its own independent track record.

@@ -20,12 +20,13 @@ what this project explicitly does *not* attempt to solve.
 ## Status
 
 **Phase 0 done, Phase 1 done, Phase 2 in progress (per-stage fingerprinting done; Iceberg
-provider and Redis anchor store not yet built).** `spark-resume-api` (the SPI) +
+fingerprint provider done; Redis anchor store not yet built).** `spark-resume-api` (the SPI) +
 `spark-resume-core` (the admission engine, the identity-isolation-safe reattach path) +
 `spark-resume-spark-3.5` (Tier 1 Spark 3.5 integration: real whole-plan AND per-stage
 fingerprinting, a capture/check decision-layer proof against two independent `SparkSession`s at
-both granularities) all build and are tested — 48/48 tests, `mvn clean install`, reproduced clean
-across multiple consecutive full runs. **Still no execution-skip mechanism anywhere in
+both granularities) + `spark-resume-iceberg` (an Iceberg `SourceFingerprint` keyed on the
+resolved snapshot id) all build and are tested — 55/55 tests, `mvn clean install`, reproduced
+clean across multiple consecutive full runs. **Still no execution-skip mechanism anywhere in
 this repository** — Tier 1 has no public Spark extension point to substitute a stage's previously-
 computed output for real execution; that needs Tier 2/3 (Phase 2+), which do not exist yet. Read
 `spark-resume-spark-3.5/README.md`'s "What this does NOT prove" section before assuming more than
@@ -43,11 +44,15 @@ spark-resume-api/         the SPI: ExchangeStore, AnchorStore, SourceFingerprint
 spark-resume-core/        the admission engine (the rule-chain runner) and SafeReattach, the
                            single enforced choke point through which this project ever calls
                            ExchangeStore.reattach. Depends on spark-resume-api only.
-spark-resume-spark-3.5/   Tier 1 Spark 3.5 integration: real physical-plan fingerprinting
-                           (file-source scans + a generic, disclosed fallback for anything else),
-                           a QueryExecutionListener-based capture path, and the admission check
-                           that ties them to spark-resume-core. See its own README for what it
-                           proves, what it doesn't, and the real bugs found building it.
+spark-resume-spark-3.5/   Tier 1 Spark 3.5 integration: real physical-plan fingerprinting, both
+                           whole-query and per-stage (file-source scans + a generic, disclosed
+                           fallback for anything else), QueryExecutionListener-based capture
+                           paths, and the admission checks that tie them to spark-resume-core.
+                           See its own README for what it proves, what it doesn't, and the real
+                           bugs found building it.
+spark-resume-iceberg/     an Iceberg SourceFingerprint keyed on the resolved snapshot id, not a
+                           file listing. A separate module so a user without Iceberg on their
+                           classpath never pulls it in. See its own README.
 docs/DESIGN.md             the full architecture design: concepts, invariants, the SPI in depth,
                            the three-tier Spark integration strategy, and the roadmap.
 ```
