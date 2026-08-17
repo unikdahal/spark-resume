@@ -1,21 +1,24 @@
 # Design: a generic shuffle/stage resumption library for Apache Spark
 
 Status: **Phase 0, Phase 1, and Phase 2 done; Phase 3 underway** (one real backend done, honestly
-partial, plus a real cross-process composition proof), with two known, disclosed gaps — an A-1
-race in the Iceberg provider's unpinned-read path (§14 Phase 2) and a documented Tier 3
-backend-capability gap in `spark-resume-celeborn`'s `reattach` (§14 Phase 3). `spark-resume-api`
-(the SPI), `spark-resume-core` (the admission engine + the identity-isolation-safe reattach path,
-now with a fourth `ReattachOutcome`, `RefusedUnsupported`), `spark-resume-spark-3.5` (Tier 1 Spark
-integration: whole-plan AND per-stage fingerprinting, capture, and admission-check, proven across
-two independent `SparkSession`s), `spark-resume-iceberg` (an Iceberg `SourceFingerprint`),
-`spark-resume-redis` (a real, cross-process `AnchorStore`), and `spark-resume-celeborn` (a real,
-cross-process `ExchangeStore`'s metadata half) are all built and tested — 92/92 tests, reproduced
-clean across multiple full runs (needs a real Redis and a real Celeborn cluster reachable — see
-each module's README), see the repo root README and each module's own README.
-`spark-resume-integration` (not counted in the 92; deliberately excluded from a bare `mvn install`
+partial, plus a real cross-process composition proof, plus a second independent `ExchangeStore`
+proving the conformance testkit itself), with two known, disclosed gaps — an A-1 race in the
+Iceberg provider's unpinned-read path (§14 Phase 2) and a documented Tier 3 backend-capability gap
+in `spark-resume-celeborn`'s `reattach` (§14 Phase 3). `spark-resume-api` (the SPI),
+`spark-resume-core` (the admission engine + the identity-isolation-safe reattach path, now with a
+fourth `ReattachOutcome`, `RefusedUnsupported`), `spark-resume-spark-3.5` (Tier 1 Spark integration:
+whole-plan AND per-stage fingerprinting, capture, and admission-check, proven across two
+independent `SparkSession`s), `spark-resume-iceberg` (an Iceberg `SourceFingerprint`),
+`spark-resume-redis` (a real, cross-process `AnchorStore`), `spark-resume-celeborn` (a real,
+cross-process `ExchangeStore`'s metadata half), and `spark-resume-fs` (a second, independent
+`ExchangeStore`, filesystem-backed, no external infrastructure) are all built and tested —
+108/108 tests, reproduced clean across multiple full runs, verified 3x back-to-back with zero
+flakes (needs a real Redis and a real Celeborn cluster reachable — see each module's README), see
+the repo root README and each module's own README.
+`spark-resume-integration` (not counted in the 108; deliberately excluded from a bare `mvn install`
 — see §14 Phase 3 and its own README) adds a real TWO-PROCESS proof the whole pipeline composes
-against real backends, terminating in the same disclosed `RefusedUnsupported` gap. Still no
-execution-skip mechanism anywhere (Phase 3+, Tier 2/3). This document
+against real backends, across FOUR real scenarios, verified 3x back-to-back (12/12 real process
+pairs, zero flakes). Still no execution-skip mechanism anywhere (Phase 3+, Tier 2/3). This document
 specifies the architecture for the project as a whole — provisionally named `spark-resume` (see
 Appendix A) — that generalizes a mechanism proven across several proof-of-concept repositories
 into a real, pluggable, production-grade library. It intentionally contains no reference to any
@@ -721,8 +724,36 @@ metrics system (a `Source` registered the standard way), not a bespoke reporting
    processes hit an unexplained JPMS `IllegalAccessError` inconsistent with every other real
    `SparkSession` in this repo; rather than chase that discrepancy, both were wrapped as thin
    scalatest specs run via `scalatest-maven-plugin`'s already-proven forking instead.
-5. **Phase 4 — scale/load validation, multi-fingerprint-provider conformance suite opened to
-   external contributors, public 1.0.**
+5. **Phase 4 — underway. First slice: `spark-resume-fs`, proving the conformance testkit itself
+   is satisfiable by an independent implementer, not just the two backends that already exist.**
+   §14's Phase 4 bullet originally bundled three things — scale/load validation, opening the
+   conformance suite to external contributors, and public 1.0 — that turned out to be gated on
+   each other, not parallel workstreams. Only one had a concrete acceptance test buildable and
+   provable with this project's own current infrastructure: is `ExchangeStoreContract` actually
+   complete and satisfiable by someone who did not write it? `spark-resume-fs` answers that with a
+   second, independent `ExchangeStore` — filesystem-backed, real files, zero external
+   infrastructure — built using ONLY the published testkit, the same way an outside contributor
+   would have to. Result: 16/16 (the shared 8-test contract, a codec spec, and 3 direct tests for
+   behavior the shared contract has no vocabulary for), no testkit changes needed this time — a
+   genuinely different outcome than `spark-resume-celeborn`'s build, which DID find a real testkit
+   defect (the `reattachSupported` hook). This is also the first REAL exerciser of the contract's
+   reattach-SUCCESS path (`reattachSupported` left at its default `true`) other than
+   `InMemoryExchangeStore`, the reference implementation the contract was originally written
+   against — every other real store in this repo (`spark-resume-celeborn`) declares that path
+   unsupported, so until this module a conformance claim about reattach-success was tested only
+   against its own author. See `spark-resume-fs/README.md` for the full account.
+
+   **Scale/load validation — deliberately deferred, not attempted.** §9's own module-layout note
+   already states the precondition: a "does this hold at production partition counts" claim must
+   be earned before being written down. This project's current infrastructure (a single-node local
+   Celeborn cluster, a podman Redis container) cannot earn that claim — a number produced against
+   it would look like evidence without being evidence. Noted here as a named precondition (real
+   multi-node Celeborn, real production-scale partition counts) rather than a task attempted with
+   the wrong infrastructure.
+
+   **Public 1.0 — not yet.** Two disclosed gaps still ship (the Iceberg A-1 race, Celeborn's
+   `reattach`), and the README correctly states nothing here is production-ready. 1.0 is
+   downstream of closing or formally accepting those, not an independent milestone to schedule.
 
 ## 15. Presenting this project publicly
 

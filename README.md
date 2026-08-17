@@ -28,10 +28,14 @@ independent `SparkSession`s at both granularities) + `spark-resume-iceberg` (an 
 `SourceFingerprint` keyed on the resolved snapshot id) + `spark-resume-redis` (the first real,
 cross-process `AnchorStore`, atomic fencing proven against a real Redis server) +
 `spark-resume-celeborn` (the first real, cross-process `ExchangeStore`, against a real vanilla
-Celeborn cluster) all build and are tested — 92/92 tests, `mvn clean install` (needs a real Redis
-reachable for `spark-resume-redis` and a real Celeborn cluster reachable for
-`spark-resume-celeborn` — see each module's README), reproduced clean across multiple consecutive
-full runs. `spark-resume-integration` (not counted in the 92 — see below) adds a real TWO-PROCESS
+Celeborn cluster) + `spark-resume-fs` (a second, independent `ExchangeStore` implementation,
+filesystem-backed, real files, zero external infrastructure — proves `ExchangeStoreContract` is
+satisfiable by someone who didn't write it, and is the first real exerciser of the contract's
+reattach-SUCCESS path other than the in-memory reference implementation) all build and are tested
+— 108/108 tests, `mvn clean install` (needs a real Redis reachable for `spark-resume-redis` and a
+real Celeborn cluster reachable for `spark-resume-celeborn` — see each module's README), reproduced
+clean across multiple consecutive full runs (verified 3x back-to-back with zero flakes after the
+partitioning fix below). `spark-resume-integration` (not counted in the 108 — see below) adds a real TWO-PROCESS
 proof that the whole pipeline — Spark capture, Redis anchor, cross-process admission,
 `SafeReattach` — composes end to end against real backends, across FOUR real scenarios (admitted →
 `RefusedUnsupported`, stale → `RefusedStale`, isolation-conflict → `RefusedIsolationConflict`, miss
@@ -87,6 +91,11 @@ spark-resume-celeborn/    the first real, cross-process ExchangeStore: Apache Ce
                            UnsupportedOperationException, a checked Tier 3 backend capability gap,
                            not a bug. Its tests need a real cluster -- run-celeborn-tests.sh stands
                            one up from the official release. See its own README.
+spark-resume-fs/          a second, independent ExchangeStore: filesystem-backed, real files, no
+                           external infrastructure. Proves ExchangeStoreContract is satisfiable by
+                           someone who didn't write it, and is the first real exerciser of the
+                           contract's reattach-SUCCESS path other than InMemoryExchangeStore. See
+                           its own README.
 spark-resume-integration/ not a library: a real TWO-PROCESS proof (ProcessA/ProcessB, two
                            separate mvn/JVM invocations) that the whole pipeline -- Spark capture,
                            Redis anchor, cross-process admission, SafeReattach -- composes end to
