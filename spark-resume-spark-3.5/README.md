@@ -76,8 +76,19 @@ No shuffle bytes are funneled through the driver; each partition's `compute()` r
 `RowBytesCodec` is what makes the bytes real: Spark's own `UnsafeRow` binary format, length-prefixed
 per row — the same shape Spark's shuffle write path uses internally — encoded by
 `StageCaptureListener`'s new `exchangeStore` parameter (reading a captured stage's ACTUAL
-materialized output via `stage.plan.execute()`, cheap since it re-reads already-computed shuffle
-output, not a recomputation) and decoded the same way inside `SkippedShuffleRDD.compute()`.
+materialized output via `stage.plan.execute()`, which re-reads already-computed shuffle output
+rather than recomputing anything upstream) and decoded the same way inside
+`SkippedShuffleRDD.compute()`.
+
+That capture path does, however, `collect()` the stage's whole output through the driver, and it
+runs for every successful query in the session — so it is bounded by an enforced
+`maxCaptureBytes` ceiling (default 256 MiB, checked against Spark's own already-recorded
+`MapOutputStatistics` *before* the job is submitted). A stage over the ceiling, or one whose
+statistics are missing entirely (size unknown), is refused and degrades to the same disclosed
+`NoHandleKind` identity-and-stats-only anchor any other capture failure produces — never an
+`OutOfMemoryError`, which would be an `Error` and so would escape this listener's `NonFatal`
+guards. A stage genuinely too large to collect wants a producer-side capture path that never
+funnels bytes through the driver at all; that is a different design, not a bigger number.
 
 `ExecutionSkipAcceptanceSpec` is the acceptance test, and it checks BOTH things a correct-results-
 only test could pass on even if the substitution silently fell through to normal execution:
@@ -87,8 +98,17 @@ query (`range(4 partitions).repartition(3).collect()`): baseline 7 tasks (4 upst
 tasks are genuinely ELIMINATED. Uses `InMemoryExchangeStore` (made `Serializable` for exactly this
 reason — its state is a plain, content-preserving `ConcurrentHashMap`, unlike a real backend's
 store, which is never shipped live; see `ExecutionSkipRule`'s `storeFactory` doc comment), so this
-module stays backend-agnostic; `spark-resume-integration`'s `skip` scenario proves the identical
-mechanism survives a real cross-process boundary against `spark-resume-fs`.
+module stays backend-agnostic.
+
+**Disclosed limitation of that in-module test specifically:** because its `storeFactory` is
+`() => exchangeStore`, closing over the live in-memory store, every task receives a serialized
+copy of the WHOLE store — all partitions — in order to read one. That is exactly the shipping
+pattern `storeFactory` exists to avoid for real backends, tolerable only because this store is a
+dev/test double holding a fixture-sized map, and it means this test's task-count result is
+insensitive to a regression that reintroduced live-store shipping on the production path. The
+honest cross-process proof is `spark-resume-integration`'s `skip` scenario, whose factory is
+`() => new FsExchangeStore(fsBaseDir)` — a small config closure, the real shape — reading real
+bytes off disk in a genuinely separate OS process.
 
 **Capture statistics are honest placeholders when no real store is wired, real when one is.**
 `SparkResumeListener` (whole-query) still has no per-stage hook and still writes disclosed

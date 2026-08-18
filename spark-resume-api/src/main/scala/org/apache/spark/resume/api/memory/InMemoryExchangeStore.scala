@@ -124,7 +124,12 @@ final class InMemoryExchangeStore extends ExchangeStore with Serializable {
       if (partitionId < 0 || partitionId >= parts.length) {
         throw new IndexOutOfBoundsException(s"partitionId=$partitionId out of range [0, ${parts.length})")
       }
-      parts(partitionId)
+      // Defensive copy, matching FsExchangeStore.readPartition (which returns a fresh array from
+      // Files.readAllBytes): without it this store alone hands back its own internal buffer, so a
+      // caller that decoded or decompressed in place would silently corrupt the stored partition
+      // for every later reader -- the two reference implementations of this SPI method must not
+      // disagree on whether the caller owns the result.
+      parts(partitionId).clone()
     case other => throw new IllegalArgumentException(s"not an InMemoryHandle: $other")
   }
 }

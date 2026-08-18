@@ -33,7 +33,8 @@ final class StageCaptureListener(
     queryId: String,
     anchorStore: AnchorStore,
     providers: Seq[SourceFingerprint],
-    exchangeStore: Option[ExchangeStore] = None)
+    exchangeStore: Option[ExchangeStore] = None,
+    maxCaptureBytes: Long = StageCaptureListener.DefaultMaxCaptureBytes)
     extends QueryExecutionListener {
 
   override def onSuccess(funcName: String, qe: QueryExecution, durationNs: Long): Unit = {
@@ -87,10 +88,43 @@ final class StageCaptureListener(
   override def onFailure(funcName: String, qe: QueryExecution, exception: Exception): Unit = ()
 
   /** Reads `stage.plan`'s ACTUAL materialized output, one real `Array[Byte]` per partition, via
-    * `RowBytesCodec.encode`. Runs a small job (`.mapPartitionsWithIndex(...).collect()`) against
-    * an ALREADY-materialized exchange -- cheap, re-reading already-computed shuffle output, not
-    * recomputing anything upstream (see `CapturedStage.plan`'s own doc comment). */
+    * `RowBytesCodec.encode`. Runs a job (`.mapPartitionsWithIndex(...).collect()`) against an
+    * ALREADY-materialized exchange -- it re-reads already-computed shuffle output rather than
+    * recomputing anything upstream (see `CapturedStage.plan`'s own doc comment).
+    *
+    * ==This pulls the stage's ENTIRE output through the driver==
+    * `collect()` means every partition's encoded bytes land in driver heap at once, so the cost is
+    * proportional to the whole stage's output, not to anything bounded -- and because this runs
+    * from a `QueryExecutionListener`, it happens for every successful query in the session, not
+    * only ones that will ever be resumed. `maxCaptureBytes` is therefore a real, enforced ceiling
+    * rather than a comment: `bytesByPartition` (Spark's own already-recorded `MapOutputStatistics`,
+    * no extra work to consult) is checked BEFORE the job is submitted, and a stage over the limit
+    * is refused outright -- which the caller turns into the same disclosed `NoHandleKind` sentinel
+    * any other capture failure produces, so an oversized stage degrades to identity-and-stats-only
+    * instead of taking the driver down with an OutOfMemoryError. An OOM here would be an `Error`,
+    * not `NonFatal`, so neither of this class's catches would contain it.
+    *
+    * A stage whose `bytesByPartition` is EMPTY is refused too, rather than treated as zero bytes:
+    * empty means `mapStats` was never populated (see `StageFingerprint.capturedStages`, which
+    * documents that as a real if uncommon case), i.e. the size is UNKNOWN, not small. Treating
+    * unknown as zero would let exactly the unbounded collect this ceiling exists to prevent
+    * through unchecked, so this fails closed like every other unresolved precondition in this
+    * project. */
   private def captureRealPartitionBytes(s: CapturedStage): Array[Array[Byte]] = {
+    if (s.bytesByPartition.isEmpty) {
+      throw new IllegalStateException(
+        "StageCaptureListener: refusing to capture stage bytes -- Spark reported no " +
+          "MapOutputStatistics for this stage, so its size is unknown and the driver-side ceiling " +
+          "cannot be enforced against it")
+    }
+    val knownBytes = s.bytesByPartition.sum
+    if (knownBytes > maxCaptureBytes) {
+      throw new IllegalStateException(
+        s"StageCaptureListener: refusing to capture stage bytes -- Spark's own statistics report " +
+          s"$knownBytes bytes across ${s.numPartitions} partitions, over the ${maxCaptureBytes}-byte " +
+          "ceiling this listener collects through the driver. Raise maxCaptureBytes deliberately if " +
+          "the driver really has the heap for it.")
+    }
     val indexed = s.plan.execute().mapPartitionsWithIndex { (i, rows) =>
       Iterator.single((i, RowBytesCodec.encode(rows)))
     }.collect()
@@ -108,6 +142,15 @@ final class StageCaptureListener(
 }
 
 object StageCaptureListener {
+
+  /** Default ceiling on how many bytes of one stage's output this listener will pull through the
+    * driver (see `captureRealPartitionBytes`). 256 MiB: comfortably above the fixtures and small
+    * real stages this capture path is useful for, comfortably below the default driver heap, and
+    * a deliberate refusal rather than a silent OOM for anything larger. Not a tuning knob for
+    * throughput -- a stage genuinely too big to collect wants a producer-side capture path that
+    * never funnels bytes through the driver at all, which is a different design, not a bigger
+    * number here. */
+  val DefaultMaxCaptureBytes: Long = 256L * 1024 * 1024
 
   /** Disclosed sentinel, not a real backend tag: no [[ExchangeStore]] is wired to per-stage
     * anchors in this phase, so there is no live handle to hold a real `handleKind` for. A caller

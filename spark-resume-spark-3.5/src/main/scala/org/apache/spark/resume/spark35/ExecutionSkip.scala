@@ -1,5 +1,7 @@
 package org.apache.spark.resume.spark35
 
+import scala.util.control.NonFatal
+
 import org.apache.spark.{Partition, SparkContext, TaskContext}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
@@ -7,6 +9,7 @@ import org.apache.spark.sql.catalyst.expressions.{Attribute, SortOrder}
 import org.apache.spark.sql.catalyst.plans.physical.Partitioning
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.execution.{LeafExecNode, SparkPlan}
+import org.apache.spark.sql.execution.adaptive.{AdaptiveSparkPlanExec, QueryStageExec}
 import org.apache.spark.sql.execution.exchange.Exchange
 
 import org.apache.spark.resume.api._
@@ -75,11 +78,32 @@ private[spark35] final case class SkippedExchangeExec(
   * and substituting a REAL byte-reading [[SkippedExchangeExec]], not an eager-execute cheat.
   *
   * Reuses `StageAdmissionCheck`'s exact admission logic (same fingerprint, same `AdmissionEngine`
-  * call) rather than re-deriving it -- the DECISION this rule makes for a given `Exchange` is
+  * call) rather than re-deriving it -- the VERDICT this rule reaches for a given `Exchange` is
   * required to be identical to what `StageAdmissionCheck.check` would report for it, since both
   * exist to answer the same question ("does this stage's anchor admit?") at two different moments
   * (a caller inspecting decisions before running the query, vs. this rule actually acting on one
   * during AQE's own plan preparation).
+  *
+  * `StageInfo.stageId` is the one field that deliberately does NOT correspond between the two, and
+  * cannot: `StageAdmissionCheck` numbers candidates by pre-order position in
+  * `AdaptiveSparkPlanExec.initialPlan` (the whole query, once, before it runs), while this rule is
+  * handed whatever plan fragment AQE's own preparation passes it, repeatedly, as stages are carved
+  * off -- there is no shared coordinate system to agree on. It is numbered here by pre-order
+  * position within the fragment this invocation actually sees, which at least makes several
+  * exchanges in one fragment distinguishable from each other (they were all `0` before Phase 4's
+  * follow-up hardening). A rule that must key on stable stage identity should use `fingerprint`,
+  * which IS the same on both sides by construction.
+  *
+  * ==A-3: this rule must never fail the query it is preparing==
+  * Registered via `injectQueryStagePrepRule`, it runs during AQE preparation of EVERY query in the
+  * session -- including queries with no `Exchange` at all, and queries that have nothing to do with
+  * resumption. Every fallible operation it performs (loading anchors from a possibly-unreachable
+  * `AnchorStore`, computing fingerprints through caller-supplied `SourceFingerprint`s,
+  * deserializing a possibly-corrupt handle payload, and the backend freshness/isolation checks) is
+  * therefore inside the guard in `apply`, which degrades to the unmodified plan -- normal
+  * execution -- rather than propagating. An earlier version guarded only the freshness/isolation
+  * pair, leaving an `AnchorStore` outage or one corrupt stored payload able to kill an unrelated
+  * user query outright.
   *
   * A stage is only ever substituted when ALL of the following hold, checked in this order, ANY
   * failure falling through to normal execution (never a partial/unsafe substitution):
@@ -98,16 +122,41 @@ private[spark35] final case class SkippedExchangeExec(
 final class ExecutionSkipRule(
     queryId: String,
     anchorStore: AnchorStore,
-    exchangeStore: ExchangeStore,
     storeFactory: () => ExchangeStore,
     providers: Seq[SourceFingerprint],
     rules: Seq[AdmissionRule] = Seq.empty)
     extends Rule[SparkPlan] {
 
-  override def apply(plan: SparkPlan): SparkPlan = {
+  /** The driver-side store every check below runs against -- built FROM `storeFactory`, never
+    * passed in alongside it. An earlier version took both a live `exchangeStore` and an
+    * independent `storeFactory`, which let the two address different backends: `handleKind`
+    * matching, `deserializeHandle`, `isFresh` and `checkIdentityIsolation` all validated one
+    * store while `SkippedShuffleRDD.compute` read the actual bytes from the other, so a caller
+    * whose two arguments disagreed got a green light from every safety check on one backend and
+    * was then silently served partition bytes from another. Deriving it here makes that
+    * mismatch unrepresentable. `lazy` so a session that never plans an `Exchange` never
+    * constructs a store at all. */
+  private lazy val exchangeStore: ExchangeStore = storeFactory()
+
+  override def apply(plan: SparkPlan): SparkPlan =
+    // A-3 (see class doc): this rule runs inside AQE's preparation of every query in the session.
+    // Nothing it does -- including reaching an external AnchorStore over the network -- may turn
+    // an unrelated user query into a failure. Any escape degrades to the unmodified plan, which
+    // is exactly normal execution.
+    try substitute(plan)
+    catch { case NonFatal(_) => plan }
+
+  private def substitute(plan: SparkPlan): SparkPlan = {
+    // Short-circuit BEFORE touching the anchor store: a plan with no Exchange has nothing this
+    // rule could ever substitute, so it must not pay for (or be able to fail on) an anchor fetch.
+    // `StageAdmissionCheck` guards its own `loadAnchors` the same way, for the same reason.
+    if (!containsExchange(plan)) {
+      return plan
+    }
     // Loaded ONCE per apply() call, not once per Exchange node -- a query with several shuffle
     // stages would otherwise re-fetch the same anchor list redundantly.
     val anchors = anchorStore.loadAnchors(StageCaptureListener.stageQueryId(queryId))
+    val stageIds = preOrderExchangeIds(plan)
 
     plan.transformUp {
       case ex: Exchange =>
@@ -117,29 +166,79 @@ final class ExecutionSkipRule(
           queryId = queryId,
           fingerprint = digest,
           anchor = anchor,
-          stageInfo = StageInfo(stageId = 0, numPartitions = anchor.map(_.numPartitions).getOrElse(0)))
+          stageInfo = StageInfo(
+            stageId = stageIds.getOrDefault(ex, 0),
+            numPartitions = anchor.map(_.numPartitions).getOrElse(0)))
 
         AdmissionEngine.decide(candidate, rules).outcome match {
           case Admitted =>
             anchor.filter(_.handleKind == exchangeStore.handleKind) match {
               case Some(a) =>
-                val handle = exchangeStore.deserializeHandle(a.handlePayload)
+                // deserializeHandle is INSIDE this guard deliberately: its own SPI contract
+                // requires it to throw on a payload it did not produce, and a stored payload can
+                // be corrupt/truncated/foreign while still carrying a matching handleKind. Before
+                // Phase 4's follow-up hardening it sat outside, so that one case failed OPEN into
+                // the user's query instead of closed to normal execution like every other branch.
                 val safeToSkip =
                   try {
-                    exchangeStore.isFresh(handle) && exchangeStore.checkIdentityIsolation(handle) == IsolationOk
+                    val handle = exchangeStore.deserializeHandle(a.handlePayload)
+                    if (exchangeStore.isFresh(handle) &&
+                        exchangeStore.checkIdentityIsolation(handle) == IsolationOk) {
+                      Some(handle)
+                    } else {
+                      None
+                    }
                   } catch {
-                    case scala.util.control.NonFatal(_) => false // A-3: never let a check here crash the query
+                    case NonFatal(_) => None // A-3: never let a check here crash the query
                   }
-                if (safeToSkip) {
-                  SkippedExchangeExec(handle, storeFactory, ex.output, ex.outputPartitioning, ex.outputOrdering)
-                } else {
-                  ex // fails closed: normal execution, same as any other admission refusal
+                safeToSkip match {
+                  case Some(handle) =>
+                    SkippedExchangeExec(handle, storeFactory, ex.output, ex.outputPartitioning, ex.outputOrdering)
+                  case None =>
+                    ex // fails closed: normal execution, same as any other admission refusal
                 }
               case None => ex // Admitted but not reattachable through THIS store -- normal execution
             }
           case _ => ex // not admitted -- normal execution
         }
-      case other => other
     }
+  }
+
+  /** Whether `plan` contains any `Exchange` this rule could substitute -- deliberately NOT
+    * `plan.exists(_.isInstanceOf[Exchange])`, which walks `children` and would therefore hit the
+    * exact trap `WholePlanFingerprint`'s doc comment warns about at length: `AdaptiveSparkPlanExec`
+    * and `QueryStageExec` are BOTH `LeafExecNode`, so `children` is `Nil` on them and a
+    * children-only walk silently reports "no exchanges" for a wrapped plan. Getting that wrong
+    * here would not fail loudly -- it would just make the skip never fire, a functional regression
+    * wearing an optimization's clothes.
+    *
+    * Deliberately a SUPERSET of what `transformUp` below can actually reach (it descends into the
+    * wrappers; `transformUp` cannot, for the same `children`-is-`Nil` reason). Erring that way is
+    * the safe direction: a false positive costs one redundant anchor fetch, a false negative would
+    * silently disable the feature. */
+  private def containsExchange(plan: SparkPlan): Boolean = plan match {
+    case _: Exchange => true
+    case a: AdaptiveSparkPlanExec => containsExchange(a.initialPlan)
+    case q: QueryStageExec => containsExchange(q.plan)
+    case other => other.children.exists(containsExchange)
+  }
+
+  /** Pre-order position of each `Exchange` in `plan`, keyed by REFERENCE (`IdentityHashMap`, not a
+    * plain `Map`): `SparkPlan` is a case class with structural equality, so two textually
+    * identical exchanges in one plan would collide into a single key and silently share an id. */
+  private def preOrderExchangeIds(plan: SparkPlan): java.util.IdentityHashMap[SparkPlan, Integer] = {
+    val ids = new java.util.IdentityHashMap[SparkPlan, Integer]()
+    var next = 0
+    def go(p: SparkPlan): Unit = {
+      p match {
+        case _: Exchange =>
+          ids.put(p, next)
+          next += 1
+        case _ =>
+      }
+      p.children.foreach(go)
+    }
+    go(plan)
+    ids
   }
 }

@@ -1,7 +1,7 @@
 package org.apache.spark.resume.fs
 
 import java.nio.charset.StandardCharsets.UTF_8
-import java.nio.file.{Files, Path, Paths, StandardCopyOption}
+import java.nio.file.{FileAlreadyExistsException, Files, Path, Paths, StandardCopyOption}
 import java.util.UUID
 
 import org.apache.spark.resume.api._
@@ -166,10 +166,15 @@ object FsExchangeStore {
     * call this directly, the same way `CelebornExchangeStoreSpec`'s fixtures drive Celeborn's real
     * data-plane client directly rather than through `ExchangeStore` itself.
     *
-    * Bumps the slot's generation via write-to-temp-file-then-atomic-rename
-    * (`Files.move(..., ATOMIC_MOVE, REPLACE_EXISTING)`) -- a real CAS-style primitive, not a
-    * read-then-write race, the same property this project's other stores get from Redis `INCR` /
-    * a Lua script / a real backend's own master. */
+    * Claims its generation atomically (`Files.createFile` on a per-generation claim marker, so
+    * concurrent writers on one slot always get DISTINCT generations and never write the same data
+    * file) and publishes it via write-to-temp-then-atomic-rename -- see [[writeGeneration]]'s
+    * `claimGeneration` for exactly what that does and does not guarantee. Note the caller's
+    * `numPartitions`/`bytesByPartition` must agree with `data`: they describe how to split it, and
+    * a mismatch is rejected rather than silently normalized (an earlier version sliced with
+    * `Array.slice`, which CLAMPS, so a declared-but-absent trailing partition became a shorter one
+    * and the manifest recorded the shorter size -- a fixture trying to build an inconsistent slot
+    * silently got a perfectly consistent one instead). */
   def writeSlot(
       baseDir: String,
       slotId: String,
@@ -182,6 +187,15 @@ object FsExchangeStore {
     // Legacy single-blob callers: split `data` back into per-partition slices matching
     // `bytesByPartition`'s claimed sizes, so the underlying storage format stays UNIFIED
     // (always per-partition files) rather than maintaining two on-disk shapes.
+    require(bytesByPartition.length == numPartitions,
+      s"FsExchangeStore.writeSlot: numPartitions=$numPartitions but bytesByPartition has " +
+        s"${bytesByPartition.length} entries")
+    require(bytesByPartition.forall(_ >= 0L),
+      s"FsExchangeStore.writeSlot: negative partition size in ${bytesByPartition.mkString(",")}")
+    require(bytesByPartition.sum == data.length.toLong,
+      s"FsExchangeStore.writeSlot: bytesByPartition sums to ${bytesByPartition.sum} but data is " +
+        s"${data.length} bytes -- these must agree exactly; silently clamping would write a slot " +
+        "whose manifest disagrees with what the caller asked for")
     val dataByPartition = new Array[Array[Byte]](numPartitions)
     var offset = 0
     for (i <- 0 until numPartitions) {
@@ -207,8 +221,7 @@ object FsExchangeStore {
     Files.createDirectories(slotDir)
 
     val currentPath = slotDir.resolve("current")
-    val priorGen = if (Files.exists(currentPath)) Files.readString(currentPath, UTF_8).trim.toLong else 0L
-    val nextGen = priorGen + 1
+    val nextGen = claimGeneration(slotDir, currentPath)
 
     val numPartitions = dataByPartition.length
     val bytesByPartition = dataByPartition.map(_.length.toLong)
@@ -225,10 +238,57 @@ object FsExchangeStore {
       mapperAttempts.mkString(",")).mkString("\n")
     Files.write(manifestPath, manifestText.getBytes(UTF_8))
 
-    val tmpCurrent = slotDir.resolve("current.tmp")
+    // Per-writer temp name, NOT a shared `current.tmp`: two writers on the same slot would
+    // otherwise race on one path, and whichever moved second would fail outright with
+    // NoSuchFileException because the first had already consumed it.
+    val tmpCurrent = slotDir.resolve(s"current.tmp.$nextGen")
     Files.write(tmpCurrent, nextGen.toString.getBytes(UTF_8))
     Files.move(tmpCurrent, currentPath, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
 
     FsHandle(slotId, nextGen)
   }
+
+  /** Claims a generation number that no other writer on this slot can also be using, by creating
+    * `gen-N.claim` with `Files.createFile` -- which is atomic (`O_CREAT | O_EXCL` underneath) and
+    * throws `FileAlreadyExistsException` rather than succeeding if someone else got there first.
+    * The loser simply advances and retries, so every concurrent writer ends up with a DISTINCT N.
+    *
+    * This is what makes the generation bump a real claim rather than the read-then-write it used
+    * to be: reading `current`, adding one, and only publishing ~20 lines later left a window in
+    * which two writers both computed the same N and then both wrote the SAME `gen-N.part-i.data`
+    * paths, interleaving two datasets into one generation that `isFresh` would then report as
+    * fresh. Distinct N per writer removes that entirely -- no two writers ever address the same
+    * data file, so a published generation is always exactly one writer's own, self-consistent
+    * output.
+    *
+    * What this deliberately does NOT claim: the final `current` pointer update is last-writer-wins
+    * across concurrent writers, so a slower writer holding a lower N can still publish after a
+    * faster one with a higher N, leaving `current` pointing at the older (complete, uncorrupted)
+    * generation. That is a lost UPDATE, not corruption -- every reader still sees some whole,
+    * internally consistent generation, which is the property `reattach`/`readPartition` actually
+    * depend on. A backend needing strict monotonic publication needs a real compare-and-set on the
+    * pointer, which a POSIX filesystem does not offer; `spark-resume-redis` gets that from Redis
+    * itself, and this store does not pretend to. */
+  private def claimGeneration(slotDir: Path, currentPath: Path): Long = {
+    val priorGen = if (Files.exists(currentPath)) Files.readString(currentPath, UTF_8).trim.toLong else 0L
+    var candidate = priorGen + 1
+    var attempts = 0
+    while (attempts < MaxGenerationClaimAttempts) {
+      try {
+        Files.createFile(slotDir.resolve(s"gen-$candidate.claim"))
+        return candidate
+      } catch {
+        case _: FileAlreadyExistsException =>
+          candidate += 1
+          attempts += 1
+      }
+    }
+    throw new IllegalStateException(
+      s"FsExchangeStore: could not claim a free generation for slot ${slotDir.getFileName} after " +
+        s"$MaxGenerationClaimAttempts attempts (last tried $candidate) -- concurrent writers on " +
+        "one slot far beyond anything this store is designed for, or a stale claim file left by a " +
+        "crashed writer")
+  }
+
+  private val MaxGenerationClaimAttempts = 1000
 }

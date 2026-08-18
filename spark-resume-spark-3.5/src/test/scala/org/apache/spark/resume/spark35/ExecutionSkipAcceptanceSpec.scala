@@ -74,7 +74,11 @@ class ExecutionSkipAcceptanceSpec extends AnyFunSuite with Matchers {
     }
     val anchors = anchorStore.loadAnchors(StageCaptureListener.stageQueryId(queryId))
     anchors should not be empty
-    anchors.head.handleKind shouldBe exchangeStore.handleKind // a REAL handle, not the NoHandleKind sentinel
+    // `forall`, not `.head`: StageCaptureListener degrades any stage whose byte capture throws to
+    // the NoHandleKind sentinel INDIVIDUALLY, so checking only the first would let a partial
+    // capture failure through while the task-count assertion below still passed on the stages that
+    // did work. ProcessA's own skip-scenario guard checks every anchor for the same reason.
+    anchors.map(_.handleKind).distinct shouldBe Seq(exchangeStore.handleKind) // REAL handles, not the NoHandleKind sentinel
 
     // -- Resuming session: ExecutionSkipRule registered via injectQueryStagePrepRule, the SAME
     // query shape run again. If the skip fires, this session's own stage never actually executes
@@ -84,8 +88,8 @@ class ExecutionSkipAcceptanceSpec extends AnyFunSuite with Matchers {
     val resumingSpark = SparkSession.builder()
       .master("local[2]")
       .appName("skip-accept-resuming")
-      .withExtensions((ext: SparkSessionExtensions) => ext.injectQueryStagePrepRule { session =>
-        new ExecutionSkipRule(queryId, anchorStore, exchangeStore, () => exchangeStore, Seq.empty)
+      .withExtensions((ext: SparkSessionExtensions) => ext.injectQueryStagePrepRule { _ =>
+        new ExecutionSkipRule(queryId, anchorStore, () => exchangeStore, Seq.empty)
       })
       .getOrCreate()
     try {
@@ -103,7 +107,6 @@ class ExecutionSkipAcceptanceSpec extends AnyFunSuite with Matchers {
     // each reading its own partition via readPartition) -- the 4 upstream map tasks are genuinely
     // ELIMINATED, not just reduced. Asserted as a relative comparison, not the exact numbers,
     // so this test doesn't become fragile to unrelated Spark scheduling changes.
-    resumedTaskCount should be < baselineTaskCount // AND fewer tasks -- the stage was genuinely skipped
     resumedTaskCount should be < baselineTaskCount // AND fewer tasks -- the stage was genuinely skipped
   }
 }

@@ -36,11 +36,20 @@ import org.apache.spark.resume.spark35.{ExecutionSkipRule, StageAdmissionCheck, 
   *     coincidental, fingerprint miss). Every decision is `RejectedBy` (no anchor matches this
   *     fingerprint); `SafeReattach` is never even called, proving a real miss composes correctly
   *     across a real process boundary too, not just an admitted match.
+  *   - `"skip"`: the one scenario that does NOT go through Celeborn, and the only one in which
+  *     execution is actually skipped. `ProcessA` captures the query's REAL row bytes through
+  *     `StageCaptureListener`'s `exchangeStore` path into a real, cross-process-durable
+  *     `spark-resume-fs` store; this process then registers `ExecutionSkipRule` via
+  *     `injectQueryStagePrepRule` and re-runs the same query shape. Asserts BOTH acceptance
+  *     criteria: identical final rows to an unresumed baseline run in this same process, AND
+  *     strictly fewer Spark tasks -- the cross-process counterpart of `spark-resume-spark-3.5`'s
+  *     `ExecutionSkipAcceptanceSpec`, which proves the same mechanism only within one JVM.
   *
   * Every scenario asserts its OWN expected terminal state explicitly (non-zero exit / failed test
   * otherwise) -- proving everything up to the backend byte-read composes correctly across real
   * processes, and that the ONLY thing that doesn't work in the `"admitted"` case is exactly, and
-  * only, the already-disclosed Tier 3 gap. No execution is skipped in any scenario. */
+  * only, the already-disclosed Celeborn Tier 3 gap. Execution is genuinely skipped in `"skip"`,
+  * and deliberately not in any of the four Celeborn-backed scenarios above. */
 object ProcessB {
 
   def main(args: Array[String]): Unit = {
@@ -83,11 +92,13 @@ object ProcessB {
     val fsBaseDir = requireEnv("FS_STORE_BASE_DIR")
 
     val redisStore = new RedisAnchorStore(redisHost, redisPort)
-    val exchangeStore = new FsExchangeStore(fsBaseDir)
     try {
       val anchorsBeforeResume = redisStore.loadAnchors(StageCaptureListener.stageQueryId(queryId))
       require(anchorsBeforeResume.nonEmpty,
         "no anchors found -- ProcessA (scenario=skip) must run first and write them")
+      require(anchorsBeforeResume.forall(_.handleKind == new FsExchangeStore(fsBaseDir).handleKind),
+        "ProcessA wrote at least one anchor WITHOUT a real fs handle (the NoHandleKind sentinel) " +
+          s"-- byte capture degraded, so this run could not prove a skip: ${anchorsBeforeResume.map(_.handleKind)}")
 
       // -- Baseline: an ordinary session, no skip rule -- ground truth for correct rows AND the
       // real task count an unresumed run of the IDENTICAL query actually needs. --
@@ -110,7 +121,7 @@ object ProcessB {
         .master("local[2]")
         .appName("skip-b-resuming")
         .withExtensions((ext: SparkSessionExtensions) => ext.injectQueryStagePrepRule { _ =>
-          new ExecutionSkipRule(queryId, redisStore, exchangeStore, () => new FsExchangeStore(fsBaseDir), Seq.empty)
+          new ExecutionSkipRule(queryId, redisStore, () => new FsExchangeStore(fsBaseDir), Seq.empty)
         })
         .getOrCreate()
       try {
