@@ -76,7 +76,16 @@ object ProcessA {
       val listener = new StageCaptureListener(queryId, redisStore, Seq.empty, exchangeStore = Some(exchangeStore))
       spark.listenerManager.register(listener)
       Fixture.query(spark).collect()
+      // Two waits, both required and neither redundant: `waitUntilEmpty` gets the onSuccess event
+      // DELIVERED, `awaitCaptures` gets the capture it queued FINISHED. StageCaptureListener does
+      // its byte capture off the listener bus thread on purpose (see its doc comment) -- and this
+      // process exits, and stops its SparkSession, immediately after this block, so anything still
+      // queued would be lost with nothing to say so.
       spark.sparkContext.listenerBus.waitUntilEmpty(30000)
+      require(listener.awaitCaptures(120000),
+        "StageCaptureListener's captures did not finish within 120s -- ProcessB would read anchors " +
+          "this process never finished writing")
+      listener.close()
 
       val anchors = redisStore.loadAnchors(StageCaptureListener.stageQueryId(queryId))
       require(anchors.nonEmpty, "StageCaptureListener wrote no anchors -- fixture bug, not a real finding")

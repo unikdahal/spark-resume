@@ -9,7 +9,7 @@ have a note, it means "not attempted," not "known to work."
 
 | Spark version | Status | Notes |
 |---|---|---|
-| 3.5.9 | **Tested** | The only Spark line this project targets today. `spark-resume-spark-3.5`'s whole suite (31 tests as of this doc, including a real execution-skip acceptance test) runs against it in `mvn install`. |
+| 3.5.9 | **Tested** | The only Spark line this project targets today. `spark-resume-spark-3.5`'s whole suite (35 tests as of this doc, including a real execution-skip acceptance test and `ExecutionSkipRuleSpec`'s four multi-exchange substitution tests) runs against it in `mvn install`. |
 | 3.0 – 3.4 | Not tested | `injectQueryStagePrepRule`/`injectQueryStageOptimizerRule` (docs/DESIGN.md §8's correction) are documented as present since Spark 3.0, but nothing in this repo has been run against any version other than 3.5.9. `WholePlanFingerprint`'s AQE-unwrap logic (`AdaptiveSparkPlanExec.initialPlan`, `QueryStageExec`) is specific to internals that may differ across minor lines — do not assume compatibility without testing. |
 | 4.x | Not tested | See `spark-resume-spark-3.5/pom.xml`'s `provided`-scope Spark dependency — this module compiles against 3.5's API surface specifically; a 4.x-targeting module would need its own `spark-resume-spark-4.x` module (see `docs/DESIGN.md` §9: "One module per supported Spark line going forward, never a single module straddling incompatible internal APIs across lines"). |
 

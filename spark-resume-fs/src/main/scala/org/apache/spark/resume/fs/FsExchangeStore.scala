@@ -41,6 +41,13 @@ import org.apache.spark.resume.api._
   *                                              needs: reading partition `i` alone, on the
   *                                              executor that will consume it, not the whole
   *                                              stage's output up front on the driver).
+  * baseDir/<slotId>/gen-<N>.claim              an empty marker proving generation `N` is taken --
+  *                                              the atomic claim primitive itself, see
+  *                                              `FsExchangeStore.claimGeneration`. Deliberately
+  *                                              never deleted by the write path;
+  *                                              `cleanupSupersededGenerations` reclaims these,
+  *                                              and the superseded manifests/data alongside them,
+  *                                              on a slot no writer is active on.
   * }}}
   *
   * @param baseDir the root directory this store instance operates under -- analogous to
@@ -196,6 +203,14 @@ object FsExchangeStore {
       s"FsExchangeStore.writeSlot: bytesByPartition sums to ${bytesByPartition.sum} but data is " +
         s"${data.length} bytes -- these must agree exactly; silently clamping would write a slot " +
         "whose manifest disagrees with what the caller asked for")
+    // The symmetric guard for the OTHER pair in this manifest, and it matters for the same reason
+    // the three above do: `ReattachResult`'s own doc comment records that a backend whose read path
+    // filters by attempt id would silently drop a mapper's real data under an all-zero placeholder,
+    // so a slot claiming N mappers with a different number of attempt ids is exactly the kind of
+    // silently-inconsistent fixture these preconditions exist to reject rather than write.
+    require(mapperAttempts.length == numMappers,
+      s"FsExchangeStore.writeSlot: numMappers=$numMappers but mapperAttempts has " +
+        s"${mapperAttempts.length} entries -- one commit attempt id per mapper, no placeholders")
     val dataByPartition = new Array[Array[Byte]](numPartitions)
     var offset = 0
     for (i <- 0 until numPartitions) {
@@ -248,10 +263,99 @@ object FsExchangeStore {
     FsHandle(slotId, nextGen)
   }
 
+  /** Deletes every artifact of a SUPERSEDED generation in `slotId` -- the `gen-N.claim`,
+    * `gen-N.manifest` and `gen-N.part-i.data` files of every generation below the one `current`
+    * points at, plus any `current.tmp.N` a writer died between writing and renaming. Returns how
+    * many files were deleted. A slot with no `current` pointer, or no directory at all, is left
+    * alone and reports `0`.
+    *
+    * Exists because nothing else ever removes those files: [[writeGeneration]] adds one claim
+    * marker (and one manifest, and one data file per partition) per write and never revisits them,
+    * so a slot rewritten repeatedly grows without bound, and `claimGeneration` below has to scan
+    * past every claim ever made on it. This is the entry point that makes the growth reclaimable
+    * instead of permanent -- deliberately an explicit maintenance call rather than something
+    * `writeGeneration` does implicitly, for the reason in the next paragraph.
+    *
+    * ==Only safe on a QUIESCENT slot==
+    * Must not run while any writer is working on `slotId`. `current` is last-writer-wins across
+    * concurrent writers (see [[claimGeneration]]), so a generation BELOW `current` can still be one
+    * a slower writer is actively writing -- deleting its claim marker would let a third writer
+    * claim that same number and interleave two datasets into one generation, precisely the
+    * corruption the claim marker exists to prevent. Readers are fine: every generation this deletes
+    * is one `isFresh` already reports `false` for, and callers are required to check that before
+    * reading (see [[FsExchangeStore.reattach]]). */
+  def cleanupSupersededGenerations(baseDir: String, slotId: String): Int = {
+    val slotDir = Paths.get(baseDir).resolve(slotId)
+    val currentPath = slotDir.resolve("current")
+    if (!Files.isDirectory(slotDir) || !Files.exists(currentPath)) {
+      0
+    } else {
+      val current = Files.readString(currentPath, UTF_8).trim.toLong
+      // Collected first, deleted after: mutating a directory while its own DirectoryStream is open
+      // is not something java.nio guarantees anything about.
+      val doomed = scala.collection.mutable.ArrayBuffer.empty[Path]
+      val stream = Files.newDirectoryStream(slotDir)
+      try {
+        val it = stream.iterator()
+        while (it.hasNext) {
+          val p = it.next()
+          if (isSuperseded(p.getFileName.toString, current)) doomed += p
+        }
+      } finally {
+        stream.close()
+      }
+      doomed.count(Files.deleteIfExists)
+    }
+  }
+
+  /** Whether `fileName` belongs to a generation `current` has already superseded. `current.tmp.N`
+    * is included for `N <= current` only: a HIGHER one may belong to a writer that has claimed its
+    * generation and not yet published it. */
+  private def isSuperseded(fileName: String, current: Long): Boolean = {
+    if (fileName.startsWith("gen-")) {
+      generationIn(fileName.stripPrefix("gen-")).exists(_ < current)
+    } else if (fileName.startsWith("current.tmp.")) {
+      generationIn(fileName.stripPrefix("current.tmp.")).exists(_ <= current)
+    } else {
+      false // `current` itself, and anything a future version of this store adds
+    }
+  }
+
+  /** The leading generation number in `rest` (everything up to the first `.`), or `None` if it is
+    * not a number at all -- an unrecognized file is left alone rather than guessed at. */
+  private def generationIn(rest: String): Option[Long] = {
+    val digits = rest.takeWhile(_ != '.')
+    try Some(digits.toLong) catch { case _: NumberFormatException => None }
+  }
+
+  /** The highest generation any claim marker in `slotDir` has ever taken, or `0` if there are
+    * none. Read to START [[claimGeneration]]'s search above every existing claim instead of at
+    * `current + 1`: `current` can legitimately point BELOW the highest claim (the lost-update case
+    * documented in `claimGeneration`), and walking up from there one `createFile` at a time made
+    * every write on a long-lived slot O(generations) in syscalls and, past
+    * `MaxGenerationClaimAttempts`, made the slot permanently unwritable. */
+  private def highestClaimedGeneration(slotDir: Path): Long = {
+    val stream = Files.newDirectoryStream(slotDir, "gen-*.claim")
+    try {
+      var highest = 0L
+      val it = stream.iterator()
+      while (it.hasNext) {
+        val n = generationIn(it.next().getFileName.toString.stripPrefix("gen-")).getOrElse(0L)
+        if (n > highest) highest = n
+      }
+      highest
+    } finally {
+      stream.close()
+    }
+  }
+
   /** Claims a generation number that no other writer on this slot can also be using, by creating
     * `gen-N.claim` with `Files.createFile` -- which is atomic (`O_CREAT | O_EXCL` underneath) and
     * throws `FileAlreadyExistsException` rather than succeeding if someone else got there first.
     * The loser simply advances and retries, so every concurrent writer ends up with a DISTINCT N.
+    * The search starts above BOTH `current` and the highest existing claim (see
+    * [[highestClaimedGeneration]]), so the retry loop only ever runs against genuinely concurrent
+    * writers rather than against the accumulated history of the slot.
     *
     * This is what makes the generation bump a real claim rather than the read-then-write it used
     * to be: reading `current`, adding one, and only publishing ~20 lines later left a window in
@@ -268,10 +372,13 @@ object FsExchangeStore {
     * internally consistent generation, which is the property `reattach`/`readPartition` actually
     * depend on. A backend needing strict monotonic publication needs a real compare-and-set on the
     * pointer, which a POSIX filesystem does not offer; `spark-resume-redis` gets that from Redis
-    * itself, and this store does not pretend to. */
+    * itself, and this store does not pretend to.
+    *
+    * Claim markers are never removed by this method (removing one would reopen the race it closed).
+    * [[cleanupSupersededGenerations]] is the entry point that reclaims them, on a quiescent slot. */
   private def claimGeneration(slotDir: Path, currentPath: Path): Long = {
     val priorGen = if (Files.exists(currentPath)) Files.readString(currentPath, UTF_8).trim.toLong else 0L
-    var candidate = priorGen + 1
+    var candidate = math.max(priorGen, highestClaimedGeneration(slotDir)) + 1
     var attempts = 0
     while (attempts < MaxGenerationClaimAttempts) {
       try {
@@ -286,8 +393,9 @@ object FsExchangeStore {
     throw new IllegalStateException(
       s"FsExchangeStore: could not claim a free generation for slot ${slotDir.getFileName} after " +
         s"$MaxGenerationClaimAttempts attempts (last tried $candidate) -- concurrent writers on " +
-        "one slot far beyond anything this store is designed for, or a stale claim file left by a " +
-        "crashed writer")
+        "one slot far beyond anything this store is designed for. Since the search starts above " +
+        "the highest existing claim, accumulated history alone cannot cause this; " +
+        "cleanupSupersededGenerations reclaims that history on a quiescent slot.")
   }
 
   private val MaxGenerationClaimAttempts = 1000

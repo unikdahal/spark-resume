@@ -68,7 +68,12 @@ class ExecutionSkipAcceptanceSpec extends AnyFunSuite with Matchers {
       val listener = new StageCaptureListener(queryId, anchorStore, Seq.empty, exchangeStore = Some(exchangeStore))
       producerSpark.listenerManager.register(listener)
       producerSpark.range(0, 4000, 1, 4).repartition(3).collect()
+      // Bus wait THEN capture wait: capture runs off the listener bus thread by design (see
+      // StageCaptureListener's doc comment), so a drained bus only means onSuccess was delivered,
+      // not that the bytes were captured -- and the session is stopped immediately below.
       producerSpark.sparkContext.listenerBus.waitUntilEmpty(30000)
+      listener.awaitCaptures(60000) shouldBe true
+      listener.close()
     } finally {
       producerSpark.stop()
     }
