@@ -1,6 +1,6 @@
 package org.apache.spark.resume.spark35
 
-import java.util.concurrent.{ExecutorService, Executors, ThreadFactory, TimeUnit}
+import java.util.concurrent.{ExecutorService, Executors, RejectedExecutionException, ThreadFactory, TimeUnit}
 import java.util.concurrent.atomic.AtomicLong
 
 import scala.util.control.NonFatal
@@ -111,13 +111,34 @@ final class StageCaptureListener(
     * waits for work already handed to the executor, and only the bus wait guarantees the
     * `onSuccess` that queues that work has been delivered at all (`QueryExecutionListener`
     * delivery is asynchronous -- see [[SparkResumeListener]]'s doc comment for the full account of
-    * that race, which cost this project a real, intermittently-failing test). */
+    * that race, which cost this project a real, intermittently-failing test).
+    *
+    * `false` means "this call did not observe the captures finish," which is three different
+    * situations, distinguished in the log rather than conflated: they genuinely ran out of time,
+    * this listener was already closed (so the barrier could not even be queued -- and anything
+    * queued before the close is still running, unobserved by this call), or the waiting thread was
+    * interrupted. Never throws. */
   def awaitCaptures(timeoutMs: Long): Boolean =
     try {
       captureExecutor.submit(new Runnable { override def run(): Unit = () })
         .get(timeoutMs, TimeUnit.MILLISECONDS)
       true
     } catch {
+      // Before the NonFatal case deliberately: this is a RuntimeException, so NonFatal would
+      // otherwise report a shutdown listener as a TIMEOUT -- a statement about elapsed time that
+      // is simply untrue, since nothing was ever waited on.
+      case e: RejectedExecutionException =>
+        logWarning(s"spark-resume: cannot await captures for queryId=$queryId -- this listener is " +
+          "already closed, so the barrier was rejected. Captures queued before the close are still " +
+          "running; this call cannot tell you whether they finished.", e)
+        false
+      // NOT NonFatal, by Scala's own definition, so this would otherwise escape a method documented
+      // to return a Boolean -- and `Future.get` has already CLEARED the interrupt flag by throwing,
+      // so failing to restore it here would swallow the interrupt outright.
+      case e: InterruptedException =>
+        Thread.currentThread().interrupt()
+        logWarning(s"spark-resume: interrupted while awaiting captures for queryId=$queryId", e)
+        false
       case NonFatal(e) =>
         logWarning(s"spark-resume: captures for queryId=$queryId did not finish within ${timeoutMs}ms", e)
         false
