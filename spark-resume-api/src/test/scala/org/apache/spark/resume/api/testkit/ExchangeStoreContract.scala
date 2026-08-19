@@ -174,8 +174,15 @@ abstract class ExchangeStoreContract extends AnyFunSuite with Matchers {
       val handle = store.store(partitions)
 
       // WRITE side: the caller still owns what it passed in, and reusing it as a scratch buffer is
-      // a real producer pattern, not an abuse.
+      // a real producer pattern, not an abuse. Both levels are checked, because the contract covers
+      // both ("must not retain `partitions`, or any array inside it"): mutating a partition's bytes
+      // in place...
       original(0) = 99
+      store.readPartition(handle, 0).toSeq shouldBe Seq[Byte](1, 2, 3)
+
+      // ...and REPLACING a slot in the outer array, which an implementation that dutifully copied
+      // every inner buffer but kept the caller's outer array would still be exposed to.
+      partitions(0) = Array[Byte](7, 7, 7)
       store.readPartition(handle, 0).toSeq shouldBe Seq[Byte](1, 2, 3)
 
       // READ side: what comes back is the caller's to decode/decompress in place.
