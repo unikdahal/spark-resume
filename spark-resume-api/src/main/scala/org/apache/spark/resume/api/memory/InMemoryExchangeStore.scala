@@ -100,6 +100,14 @@ final class InMemoryExchangeStore extends ExchangeStore with Serializable {
 
   override def store(partitions: Array[Array[Byte]]): ExchangeHandle = {
     val id = java.util.UUID.randomUUID().toString
+    // Defensive copy on the WRITE side, the mirror of readPartition's below and required by the
+    // same SPI rule (see ExchangeStore.store): a real backend durably copies the caller's bytes
+    // somewhere -- FsExchangeStore writes them to disk and never looks at the caller's arrays
+    // again -- so a producer reusing one scratch buffer across partitions is a legitimate caller.
+    // Retaining these arrays by reference would let such a producer mutate data already "stored,"
+    // silently changing what every later readPartition returns and leaving the bytesByPartition
+    // snapshotted just below describing something that no longer exists.
+    val owned = partitions.map(_.clone())
     // A synthesized ReattachResult, not real producer-supplied statistics -- this is the
     // reference/dev-only store, whose whole point is being usable with zero setup; a caller
     // needing REAL statistics from a REAL production run should be using a real backend
@@ -107,11 +115,11 @@ final class InMemoryExchangeStore extends ExchangeStore with Serializable {
     // mapperAttempts entry per partition is a documented simplification for this store alone.
     val result = ReattachResult(
       numMappers = 1,
-      numPartitions = partitions.length,
-      bytesByPartition = partitions.map(_.length.toLong),
+      numPartitions = owned.length,
+      bytesByPartition = owned.map(_.length.toLong),
       rowCount = 0L,
       mapperAttempts = Array(0))
-    records.put(id, Record(result, superseded = false, identityConflict = false, partitions = Some(partitions)))
+    records.put(id, Record(result, superseded = false, identityConflict = false, partitions = Some(owned)))
     InMemoryHandle(id)
   }
 
@@ -124,11 +132,11 @@ final class InMemoryExchangeStore extends ExchangeStore with Serializable {
       if (partitionId < 0 || partitionId >= parts.length) {
         throw new IndexOutOfBoundsException(s"partitionId=$partitionId out of range [0, ${parts.length})")
       }
-      // Defensive copy, matching FsExchangeStore.readPartition (which returns a fresh array from
-      // Files.readAllBytes): without it this store alone hands back its own internal buffer, so a
-      // caller that decoded or decompressed in place would silently corrupt the stored partition
-      // for every later reader -- the two reference implementations of this SPI method must not
-      // disagree on whether the caller owns the result.
+      // Defensive copy, as ExchangeStore.readPartition's contract requires of every implementation
+      // (and as FsExchangeStore gets for free from Files.readAllBytes): without it this store alone
+      // hands back its own internal buffer, so a caller that decoded or decompressed in place would
+      // silently corrupt the stored partition for every later reader. Enforced for all backends by
+      // ExchangeStoreContract's buffer-ownership test, not just asserted here.
       parts(partitionId).clone()
     case other => throw new IllegalArgumentException(s"not an InMemoryHandle: $other")
   }

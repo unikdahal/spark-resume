@@ -92,11 +92,14 @@ object ProcessB {
     val fsBaseDir = requireEnv("FS_STORE_BASE_DIR")
 
     val redisStore = new RedisAnchorStore(redisHost, redisPort)
+    // One store, named once: every anchor below is checked against the SAME backend, and the
+    // resuming session's own factory builds from the same fsBaseDir.
+    val exchangeStore = new FsExchangeStore(fsBaseDir)
     try {
       val anchorsBeforeResume = redisStore.loadAnchors(StageCaptureListener.stageQueryId(queryId))
       require(anchorsBeforeResume.nonEmpty,
         "no anchors found -- ProcessA (scenario=skip) must run first and write them")
-      require(anchorsBeforeResume.forall(_.handleKind == new FsExchangeStore(fsBaseDir).handleKind),
+      require(anchorsBeforeResume.forall(_.handleKind == exchangeStore.handleKind),
         "ProcessA wrote at least one anchor WITHOUT a real fs handle (the NoHandleKind sentinel) " +
           s"-- byte capture degraded, so this run could not prove a skip: ${anchorsBeforeResume.map(_.handleKind)}")
 

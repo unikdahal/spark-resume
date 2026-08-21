@@ -263,6 +263,17 @@ checked backend capability, not two to declare). See `spark-resume-fs`'s `store`
 (real, per-partition files) and `spark-resume-celeborn`'s (both throw, same Tier 3 gap as
 `reattach`) for the two real implementations, and §8's correction below for what this unlocked.
 
+**Buffer ownership is part of that contract, not an implementation detail.** Both methods specify
+caller-owned arrays: `store` must not retain what it was handed (a producer reusing one scratch
+buffer across partitions is a legitimate caller), and `readPartition` must not hand back an array
+the backend still refers to (a caller decoding or decompressing in place is a legitimate caller).
+A backend reading from or writing to durable storage gets both for free; an in-process one has to
+copy deliberately. This was originally written as a comment on the one implementation where it had
+been noticed, which bound nothing: getting it wrong is SILENT — no call fails, the stored partition
+simply becomes something else for every later reader — so it lives in the SPI doc and in an
+`ExchangeStoreContract` test that mutates on both sides and re-reads, which every implementation
+now has to pass.
+
 ```scala
 package org.apache.spark.resume.api
 
@@ -464,6 +475,47 @@ across a real OS process boundary against `spark-resume-fs` (real per-partition 
 cross-process durability) — the first genuinely cross-process execution-skip in this repo's
 history. `spark-resume-celeborn` still cannot serve this role: its `store`/`readPartition` are the
 same Tier 3 gap as `reattach`.
+
+**Second follow-up, same phase: four things the single-exchange fixture could not have caught.**
+Everything above was proven by a `range(4).repartition(3)` query — one shuffle, one anchor — and a
+review of the rule against multi-exchange plans found three real holes plus one unit error, none of
+which that fixture can reach. They are recorded here rather than only in the code because each is a
+property of the DESIGN, not a slip in one expression:
+
+1. **The substitution walk must be top-down.** An exchange's digest is computed over the subtree
+   rooted at it, so rewriting bottom-up fingerprints every exchange AFTER its own children were
+   already replaced: an exchange above a skipped one hashes a tree containing `SkippedExchangeExec`
+   rather than the original subtree its anchor was captured from, never matches, and silently
+   re-executes. Only the innermost shuffle of a multi-shuffle query could ever be skipped. Top-down
+   also skips strictly more — substituting an outer exchange removes its whole subtree, whose bytes
+   the outer stage's stored output already subsumes.
+2. **The rule must be scoped to `ShuffleExchangeLike`, matching the capture side**, not to
+   `Exchange`. Capture is `ShuffleQueryStageExec`-only by design (broadcast output is an in-memory
+   broadcast variable, not shuffle-service-addressable bytes), so matching every `Exchange` left
+   the two sides disagreeing by construction, held safe only by digests never colliding — and a
+   `BroadcastExchangeExec` replaced by a node implementing `doExecute` alone would throw
+   `UnsupportedOperationException` from the downstream join's `executeBroadcast()`, an A-3 violation
+   with no bug required on this side.
+3. **Partition-count agreement is a precondition, not a catch.** `SkippedShuffleRDD` takes its
+   partition count from the PLAN while the stored bytes have the producing run's; a disagreement
+   surfaces on an EXECUTOR, reading an index nobody wrote, past the point where falling through to
+   normal execution is still possible. A-3's "any failure falls through" only holds if the check
+   happens on the driver, so the anchor's `numPartitions` is now compared before substituting.
+4. **A driver-heap ceiling has to be measured in driver-heap bytes.** `StageCaptureListener`'s
+   capture ceiling was enforced against `MapOutputStatistics.bytesByPartitionId` — serialized,
+   compressed shuffle-write bytes — while what it allocates is uncompressed `UnsafeRow` bytes plus
+   a per-row length prefix, commonly several times larger. Spark's statistics are still consulted
+   first as a free lower bound that can refuse early, but the real ceiling is now accumulated in
+   the capture job's own result handler as partitions arrive, and a second, whole-session ceiling
+   bounds the series that a per-stage ceiling alone never could (`onSuccess` fires for every
+   successful query, and nothing in this project evicts what it stored). That capture also moved
+   OFF the listener bus thread: blocking a `LiveListenerBus` queue for the duration of a Spark job
+   makes Spark silently drop events past the queue capacity, including the task-end events this
+   project's own acceptance criteria are counted from.
+
+`ExecutionSkipRuleSpec` covers 1–3 directly against real multi-exchange plans, without executing
+anything: the acceptance test's "same rows, fewer tasks" criterion is real but far too coarse to
+say WHICH exchange was substituted.
 
 ## 9. Module layout
 

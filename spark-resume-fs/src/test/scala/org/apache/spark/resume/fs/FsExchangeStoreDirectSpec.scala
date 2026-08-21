@@ -56,6 +56,62 @@ class FsExchangeStoreDirectSpec extends AnyFunSuite with Matchers {
     an[IndexOutOfBoundsException] should be thrownBy store.readPartition(handle, 3)
   }
 
+  test("writeSlot rejects a mapperAttempts array that disagrees with numMappers") {
+    // The symmetric case to the numPartitions/bytesByPartition checks above: a manifest claiming 4
+    // mappers with a single attempt id is exactly the silently-inconsistent slot ReattachResult's
+    // own doc comment warns about (a backend filtering by attempt id would drop three mappers'
+    // real data under an all-zero placeholder), and it used to be accepted and written to disk.
+    an[IllegalArgumentException] should be thrownBy FsExchangeStore.writeSlot(
+      baseDir, s"bad-attempts-${UUID.randomUUID()}",
+      numMappers = 4, numPartitions = 1,
+      bytesByPartition = Array(1L), rowCount = 1L, mapperAttempts = Array(0),
+      data = Array[Byte](1))
+  }
+
+  test("cleanupSupersededGenerations reclaims old generations and leaves the current one readable") {
+    val slotId = s"cleanup-${UUID.randomUUID()}"
+    val gen1 = FsExchangeStore.writeSlot(baseDir, slotId, 1, 1, Array(1L), 1L, Array(0), Array[Byte](7))
+    val gen2 = FsExchangeStore.writeSlot(baseDir, slotId, 1, 1, Array(2L), 1L, Array(0), Array[Byte](8, 9))
+    val store = newStore()
+    store.isFresh(gen1) shouldBe false
+    store.isFresh(gen2) shouldBe true
+
+    val slotDir = java.nio.file.Paths.get(baseDir, slotId)
+    Files.exists(slotDir.resolve(s"gen-${gen1.generation}.claim")) shouldBe true // nothing removes these on write
+
+    // Every gen-1 artifact goes: the claim marker, the manifest, and the partition data. Without
+    // this entry point they accumulate for the life of the slot, one set per write, with no way to
+    // reclaim them short of deleting files by hand.
+    FsExchangeStore.cleanupSupersededGenerations(baseDir, slotId) should be >= 3
+    Files.exists(slotDir.resolve(s"gen-${gen1.generation}.claim")) shouldBe false
+    Files.exists(slotDir.resolve(s"gen-${gen1.generation}.manifest")) shouldBe false
+    Files.exists(slotDir.resolve(s"gen-${gen1.generation}.part-0.data")) shouldBe false
+
+    // The CURRENT generation is untouched and still fully readable -- cleanup reclaims history,
+    // it does not disturb the data anyone could legitimately still be reading.
+    store.isFresh(gen2) shouldBe true
+    store.readPartition(gen2, 0).toSeq shouldBe Seq[Byte](8, 9)
+    store.reattach(gen2).numPartitions shouldBe 1
+
+    // And the slot is still writable, with a DISTINCT, higher generation -- cleanup must not look
+    // like a counter reset to the next writer.
+    FsExchangeStore.writeSlot(baseDir, slotId, 1, 1, Array(1L), 1L, Array(0), Array[Byte](1))
+      .generation shouldBe 3L
+  }
+
+  test("a stale claim marker from a crashed writer does not make later writes rescan it") {
+    val slotId = s"stale-claim-${UUID.randomUUID()}"
+    FsExchangeStore.writeSlot(baseDir, slotId, 1, 1, Array(1L), 1L, Array(0), Array[Byte](1))
+    // A writer that claimed generation 500 and died before publishing: `current` still says 1, so a
+    // search starting at `current + 1` would walk up one createFile syscall at a time through every
+    // claim in between -- and, once such a run exceeds MaxGenerationClaimAttempts, would leave the
+    // slot permanently unwritable. Starting above the HIGHEST claim makes the next write O(1)
+    // regardless of how much history the slot has.
+    Files.createFile(java.nio.file.Paths.get(baseDir, slotId, "gen-500.claim"))
+    FsExchangeStore.writeSlot(baseDir, slotId, 1, 1, Array(1L), 1L, Array(0), Array[Byte](2))
+      .generation shouldBe 501L
+  }
+
   test("writeSlot generations are monotonic per slotId, independent across different slotIds") {
     val slotA = s"slot-a-${UUID.randomUUID()}"
     val slotB = s"slot-b-${UUID.randomUUID()}"

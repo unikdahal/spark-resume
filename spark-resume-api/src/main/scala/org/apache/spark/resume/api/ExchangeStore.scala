@@ -117,7 +117,16 @@ trait ExchangeStore {
     * project structurally handles via `SafeReattach`'s `RefusedUnsupported`), a PRODUCER unable to
     * store its own output at all means that backend can never back a real anchor for anyone, which
     * is a fact worth a loud, explicit exception at the one call site that would ever invoke it,
-    * not a routine, silently-tolerated outcome. */
+    * not a routine, silently-tolerated outcome.
+    *
+    * BUFFER OWNERSHIP: implementations MUST NOT retain `partitions`, or any array inside it, by
+    * reference beyond this call -- copy anything that has to outlive it. A backend that writes the
+    * bytes somewhere durable (a file, a socket) gets this for free; an in-process one has to copy
+    * deliberately. The caller keeps ownership of the arrays it passed and is entitled to reuse or
+    * mutate them afterwards, which is a real producer pattern (one scratch buffer reused across
+    * partitions), so an implementation retaining them would silently change data it had already
+    * reported as stored. Enforced for every implementation by
+    * `org.apache.spark.resume.api.testkit.ExchangeStoreContract`, not left as a convention. */
   def store(partitions: Array[Array[Byte]]): ExchangeHandle
 
   /** The inverse of [[store]]: the exact bytes written for partition `partitionId` of `handle`.
@@ -130,6 +139,14 @@ trait ExchangeStore {
     *
     * `partitionId` out of range for `handle`, or otherwise unreadable, MUST throw rather than
     * return an empty/zero-length result that could be silently misread as "this partition really
-    * has no data" -- the same fail-loud posture [[reattach]]'s own doc comment requires. */
+    * has no data" -- the same fail-loud posture [[reattach]]'s own doc comment requires.
+    *
+    * BUFFER OWNERSHIP: the returned array belongs to the CALLER, who may decode, decompress or
+    * otherwise mutate it in place. An implementation MUST NOT return an array it still refers to
+    * itself -- a backend reading from durable storage gets this for free (`Files.readAllBytes` and
+    * every socket read allocate a fresh array), an in-process one has to copy deliberately. Getting
+    * it wrong does not fail here: it silently corrupts the STORED partition for every later reader.
+    * Enforced for every implementation by
+    * `org.apache.spark.resume.api.testkit.ExchangeStoreContract`, not left as a convention. */
   def readPartition(handle: ExchangeHandle, partitionId: Int): Array[Byte]
 }

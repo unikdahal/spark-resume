@@ -15,8 +15,14 @@ class StageAdmissionCheckIntegrationSpec extends SparkTestBase {
   private def captureAndWait(spark: SparkSession, listener: StageCaptureListener)(query: => Unit): Unit = {
     spark.listenerManager.register(listener)
     query
+    // BOTH waits, in this order, and neither is redundant: the bus wait guarantees onSuccess was
+    // DELIVERED, awaitCaptures guarantees the work it queued onto the listener's own thread
+    // FINISHED. StageCaptureListener deliberately does no capture work on the listener bus thread
+    // (see its doc comment), so the bus draining no longer implies the anchors are written.
     spark.sparkContext.listenerBus.waitUntilEmpty(30000)
+    listener.awaitCaptures(30000) shouldBe true
     spark.listenerManager.unregister(listener)
+    listener.close()
   }
 
   test("capture then check the IDENTICAL shuffle query in a second session -> one stage, Admitted, with REAL stats") {

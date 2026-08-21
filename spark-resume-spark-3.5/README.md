@@ -80,15 +80,34 @@ materialized output via `stage.plan.execute()`, which re-reads already-computed 
 rather than recomputing anything upstream) and decoded the same way inside
 `SkippedShuffleRDD.compute()`.
 
-That capture path does, however, `collect()` the stage's whole output through the driver, and it
-runs for every successful query in the session — so it is bounded by an enforced
-`maxCaptureBytes` ceiling (default 256 MiB, checked against Spark's own already-recorded
-`MapOutputStatistics` *before* the job is submitted). A stage over the ceiling, or one whose
-statistics are missing entirely (size unknown), is refused and degrades to the same disclosed
-`NoHandleKind` identity-and-stats-only anchor any other capture failure produces — never an
-`OutOfMemoryError`, which would be an `Error` and so would escape this listener's `NonFatal`
-guards. A stage genuinely too large to collect wants a producer-side capture path that never
-funnels bytes through the driver at all; that is a different design, not a bigger number.
+That capture path does, however, pull the stage's whole output through the driver, and it runs for
+every successful query in the session — so it is bounded by two enforced ceilings, `maxCaptureBytes`
+(default 256 MiB) for one stage and `maxSessionCaptureBytes` (default 1 GiB) for everything one
+listener ever captures. Both are enforced against the bytes **actually allocated on the driver**,
+accumulated in the capture job's own result handler as partitions arrive, so exceeding either fails
+(and cancels) that job in flight. Spark's own `MapOutputStatistics` are still consulted first,
+because they are free and already recorded — but only as a *lower bound* that can refuse early,
+never approve: they count serialized, compressed shuffle-write bytes, while what the driver
+allocates is uncompressed `UnsafeRow` bytes plus a length prefix per row, commonly several times
+larger. Enforcing a driver-heap ceiling against the compressed number was a unit error, and a stage
+comfortably under it could still exhaust a default driver heap. A stage over either ceiling, or one
+whose size is genuinely unknown (no statistics *and* a non-zero mapper count — a shuffle with zero
+mappers wrote nothing, which is a known size, not an unknown one), is refused and degrades to the
+same disclosed `NoHandleKind` identity-and-stats-only anchor any other capture failure produces,
+with the reason logged — never an `OutOfMemoryError`, which would be an `Error` and so would escape
+this listener's `NonFatal` guards. A stage genuinely too large to collect wants a producer-side
+capture path that never funnels bytes through the driver at all; that is a different design, not a
+bigger number.
+
+The capture itself runs on the listener's own thread, never on the listener bus. `onSuccess` is
+dispatched on the shared `LiveListenerBus` queue thread, so running a Spark job inline there would
+block that queue for the job's whole duration — and once a queue passes
+`spark.scheduler.listenerbus.eventqueue.capacity` (default 10000) Spark **drops** events silently,
+including the `SparkListenerTaskEnd`s this module's own acceptance tests count. The cost of that is
+that a drained listener bus no longer means the capture finished: a caller who must observe the
+anchors (a test, or a producer process about to exit) calls `listenerBus.waitUntilEmpty(...)` and
+then `StageCaptureListener.awaitCaptures(...)` — the first gets the event delivered, the second gets
+the work it queued finished.
 
 `ExecutionSkipAcceptanceSpec` is the acceptance test, and it checks BOTH things a correct-results-
 only test could pass on even if the substitution silently fell through to normal execution:

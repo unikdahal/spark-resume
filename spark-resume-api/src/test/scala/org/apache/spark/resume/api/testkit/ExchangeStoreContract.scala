@@ -158,4 +158,37 @@ abstract class ExchangeStoreContract extends AnyFunSuite with Matchers {
       an[UnsupportedOperationException] should be thrownBy store.store(partitions)
     }
   }
+
+  test("neither store nor readPartition leaves the caller sharing a buffer with the backend") {
+    // ExchangeStore.store / readPartition both specify caller-owned buffers, and getting either
+    // wrong is SILENT: no call fails, the stored partition just quietly becomes something else for
+    // every later reader. That makes it exactly the kind of rule that has to live in the contract
+    // rather than in one implementation's comment -- a backend returning its own internal buffer
+    // (or retaining the caller's) passes every other test in this suite unchanged.
+    val store = newStore()
+    val original = Array[Byte](1, 2, 3)
+    val partitions = Array(original, Array[Byte](4, 5, 6, 7))
+    if (!reattachSupported) {
+      info("this implementation declares store/readPartition unsupported (Tier 3 backend gap) -- skipped")
+    } else {
+      val handle = store.store(partitions)
+
+      // WRITE side: the caller still owns what it passed in, and reusing it as a scratch buffer is
+      // a real producer pattern, not an abuse. Both levels are checked, because the contract covers
+      // both ("must not retain `partitions`, or any array inside it"): mutating a partition's bytes
+      // in place...
+      original(0) = 99
+      store.readPartition(handle, 0).toSeq shouldBe Seq[Byte](1, 2, 3)
+
+      // ...and REPLACING a slot in the outer array, which an implementation that dutifully copied
+      // every inner buffer but kept the caller's outer array would still be exposed to.
+      partitions(0) = Array[Byte](7, 7, 7)
+      store.readPartition(handle, 0).toSeq shouldBe Seq[Byte](1, 2, 3)
+
+      // READ side: what comes back is the caller's to decode/decompress in place.
+      val read = store.readPartition(handle, 0)
+      read(0) = 42
+      store.readPartition(handle, 0).toSeq shouldBe Seq[Byte](1, 2, 3)
+    }
+  }
 }
