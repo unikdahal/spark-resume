@@ -775,10 +775,11 @@ metrics system (a `Source` registered the standard way), not a bespoke reporting
    `deserializeHandle`, `isFresh` (a live query against the master's admin REST API), and
    `checkIdentityIsolation` are real and tested against a real Celeborn master and worker
    (`ExchangeStoreContract`'s 8 tests, plus a `SafeReattach.attempt` end-to-end proof against the
-   real cluster). `checkIdentityIsolation` is a genuine, tested guard against a real hazard: it
-   refuses `IsolationConflict` when a resuming driver's own `appUniqueId` matches the anchor's
-   producing `appUniqueId`, since Celeborn scopes a shuffle's registration to the `appUniqueId`
-   that created it and reusing that id would silently collide with already-materialized wire state.
+   real cluster). `checkIdentityIsolation` is a genuine, tested guard against the unfenced
+   same-namespace hazard. Later upstream implementation work established that a different
+   `appUniqueId` is not a recovery solution either: it cannot address shuffle keys containing the
+   producer ID. Production recovery therefore needs the stable logical namespace plus a newer,
+   monotonically fenced driver epoch; `docs/RESUMABLE-SPARK-ROADMAP.md` is authoritative here.
 
    `reattach` throws a documented `UnsupportedOperationException` — Tier 3 exactly as this
    section's own header describes it, confirmed by checking vanilla Celeborn `0.7.0`'s actual

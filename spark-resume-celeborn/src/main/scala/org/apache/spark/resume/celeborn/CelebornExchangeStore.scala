@@ -36,11 +36,9 @@ import org.apache.spark.resume.api._
   *   `celeborn.master.http.port` on the master).
   * @param callerAppUniqueId this DRIVER PROCESS's own Celeborn application identity -- the value
   *   this process would register shuffles under, if it were producing rather than resuming. Used
-  *   by [[checkIdentityIsolation]] to enforce a real hazard: a resuming driver that (through
-  *   misconfiguration, not this library's own choice) launches
-  *   under the SAME `appUniqueId` as the run that produced the anchor being checked would
-  *   silently collide with already-materialized shuffle state on the wire, rather than erroring
-  *   (see that method's doc comment for the full account). */
+  *   by [[checkIdentityIsolation]] to detect the unfenced same-namespace hazard. A different ID
+  *   avoids collision but cannot address the producer's keys; a patched backend must instead use
+  *   the stable namespace with a newer driver epoch (see that method's doc comment). */
 final class CelebornExchangeStore(masterRestBaseUrl: String, callerAppUniqueId: String) extends ExchangeStore {
 
   private val shuffleApi: ShuffleApi = {
@@ -71,13 +69,10 @@ final class CelebornExchangeStore(masterRestBaseUrl: String, callerAppUniqueId: 
     case other => throw new IllegalArgumentException(s"not a CelebornHandle: $other")
   }
 
-  /** The real, disclosed hazard this project found empirically (see this class's own doc comment
-    * and this method's on [[ExchangeStore]]): a resuming driver whose OWN Celeborn `appUniqueId`
-    * happens to equal the `appUniqueId` a handle's data was originally produced under is not a
-    * safe reattach, even if the shuffle is otherwise fresh -- it risks colliding with
-    * already-materialized wire state from that original run rather than cleanly reading its
-    * committed output. Purely local: compares `handle.appUniqueId` against `callerAppUniqueId`,
-    * no cluster round-trip needed. */
+  /** A same-ID caller is unsafe against vanilla Celeborn because there is no driver-epoch fence.
+    * A different ID is namespace-isolated but still cannot read the producer's shuffle keys, so
+    * [[reattach]] refuses it separately. Production recovery needs the producer's stable logical
+    * namespace plus a newer fenced epoch; changing only the application ID is not recovery. */
   override def checkIdentityIsolation(handle: ExchangeHandle): IsolationResult = handle match {
     case CelebornHandle(producingAppUniqueId, _) =>
       if (producingAppUniqueId == callerAppUniqueId) {
@@ -85,7 +80,8 @@ final class CelebornExchangeStore(masterRestBaseUrl: String, callerAppUniqueId: 
           s"resuming driver's own appUniqueId ('$callerAppUniqueId') is IDENTICAL to the " +
             "appUniqueId this anchor's data was produced under -- reattaching would risk " +
             "colliding with that run's own wire state rather than cleanly reading its " +
-            "committed output; launch the resuming driver under a distinct appUniqueId")
+            "committed output; vanilla Celeborn has no driver-epoch fence. A distinct " +
+            "appUniqueId is isolated but cannot address these shuffle keys either")
       } else {
         IsolationOk
       }

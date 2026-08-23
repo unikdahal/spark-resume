@@ -12,13 +12,9 @@ yourself: `Seq(new IcebergFingerprintProvider(), new FileSourceFingerprint())`.
 ## What this proves
 
 `IcebergFingerprintProviderSpec` runs real commits against a local Hadoop-catalog Iceberg table
-(no external infrastructure needed) and asserts on the actual resulting fingerprints: stability
-across two independent `SparkSession`s reading an unmutated table, a changed fingerprint after a
-committing `INSERT` (the go/no-go property), discrimination between different tables with
-identical content, correct resolution of a `VERSION AS OF` time-travel read (pinned to the
-snapshot the query actually asked for, not whatever is current later), and the disclosed
-empty-table sentinel for a table with no commits yet. 8 tests, all passing, reproduced clean
-across multiple full `mvn clean install` runs.
+and proves that explicitly pinned snapshots are stable and discriminating. It also proves that
+ordinary, branch, and empty-table reads fail closed: this post-execution integration cannot obtain
+their immutable plan-time snapshot through Iceberg's public API.
 
 ## How the snapshot id is actually reached — a real finding, not a lookup
 
@@ -30,28 +26,21 @@ third-party connector's internals, which this project's own posture (`docs/DESIG
 API only, no silent internals-reaching) rules out. The path that *is* public: `BatchScanExec.table`
 (Spark's own public DSv2 `Table` accessor) can be cast to `org.apache.iceberg.spark.source.SparkTable`
 — a genuinely public Iceberg class, meant to be catalog-visible — whose public
-`snapshotId()`/`branch()`/`table()` accessors give everything needed. See
-`IcebergFingerprintProvider`'s doc comment for the full three-way resolution order (branch, then
-pinned snapshot, then current) and why fingerprinting a branch *name* instead of its resolved tip
-would itself be a false-positive-resumption hazard (a branch is a moving pointer).
+`snapshotId()` accessor gives an immutable identity for explicitly pinned reads. `branch()` and
+`table().currentSnapshot()` are moving references and are deliberately not used for admission.
 
 ## What this does NOT prove
 
 Same Tier 1 scope limits as `spark-resume-spark-3.5`: no execution is skipped, this is identity
-only. Untested: reading via a named Iceberg branch (the resolution code path exists and is
-reasoned about in the doc comment, but no test in this suite commits two snapshots to a branch and
-asserts the fingerprint follows the branch's tip rather than staying pinned to the first one).
+only. Ordinary and named-branch reads are not resumable until Spark or Iceberg exposes their
+immutable resolved snapshot before execution.
 
-## KNOWN GAP, NOT FIXED: a real A-1 hazard on the unpinned-read capture path
+## Unpinned reads fail closed
 
 Confirmed by a dedicated test (`IcebergFingerprintProviderSpec`'s "KNOWN GAP" case), not just
 suspected: the SAME `BatchScanExec`/`SparkTable` object, fingerprinted once right after a query is
 planned and again after it actually executes (with an unrelated `INSERT` committed in between),
-returns a DIFFERENT snapshot id the second time — even though the query itself read the FIRST
-snapshot's data. The real capture path always calls this provider post-execution, so a commit
-landing in that window writes an anchor fingerprinted to data newer than what was actually
-captured — a real false-positive-resumption risk, not a cosmetic edge case. No public Iceberg API
-was found to fix it (the field that IS fixed at scan-build time is package-private; see
-`IcebergFingerprintProvider`'s doc comment for every path that was checked and ruled out). Affects
-unpinned reads only — `VERSION AS OF` pinning is unaffected. Do not treat an anchor from this
-provider as safe against a commit racing the capture listener until this is resolved.
+returns a different snapshot id the second time even though the query read the first snapshot.
+The provider now rejects that shape, and `WholePlanFingerprint` converts the rejection into a
+unique `NON_REUSABLE` token. Consequently two computations cannot match and admission recomputes.
+This closes the wrong-answer exposure; it does not yet provide resumption for ordinary reads.

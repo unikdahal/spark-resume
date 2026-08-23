@@ -2,8 +2,10 @@ package org.apache.spark.resume.spark35
 
 import scala.util.control.NonFatal
 
-import org.apache.spark.sql.execution.{ColumnarToRowExec, InputAdapter, SparkPlan, WholeStageCodegenExec}
+import org.apache.spark.sql.execution.{ColumnarToRowExec, FileSourceScanExec, InputAdapter,
+  RowDataSourceScanExec, SparkPlan, WholeStageCodegenExec}
 import org.apache.spark.sql.execution.adaptive.{AdaptiveSparkPlanExec, AQEShuffleReadExec, QueryStageExec}
+import org.apache.spark.sql.execution.datasources.v2.DataSourceV2ScanExecBase
 
 import org.apache.spark.resume.api.SourceFingerprint
 
@@ -113,11 +115,27 @@ object WholePlanFingerprint {
         } catch {
           // A-3: a provider's own bug must degrade this ONE leaf to the disclosed fallback, not
           // crash fingerprint computation for the whole query.
-          case NonFatal(e) => degradedFallback(leaf, Some(e.toString))
+          case NonFatal(e) => nonReusable(leaf, e.toString)
         }
+      case None if isConnectorScan(leaf) =>
+        nonReusable(leaf, "no registered SourceFingerprint supports this connector scan")
       case None => degradedFallback(leaf, None)
     }
   }
+
+  /** Connector scans are never allowed through the structural fallback. A connector-owned
+    * `toString` is not a data-version contract; two reads of different source state can render
+    * identically and false-admit. A random token deliberately cannot match another computation,
+    * converting unknown identity into recomputation instead of a wrong answer. */
+  private def isConnectorScan(plan: SparkPlan): Boolean = plan match {
+    case _: FileSourceScanExec => true
+    case _: RowDataSourceScanExec => true
+    case _: DataSourceV2ScanExecBase => true
+    case _ => false
+  }
+
+  private def nonReusable(leaf: SparkPlan, reason: String): String =
+    s"NON_REUSABLE:${leaf.getClass.getName}:$reason:${java.util.UUID.randomUUID()}"
 
   /** Class name + `.expressions` + `.toString()`, not class name + `.expressions` alone -- found
     * necessary by testing, not predicted: a leaf's data-defining parameters are not always

@@ -30,21 +30,14 @@ import org.apache.spark.resume.api.{FingerprintTarget, SourceFingerprint}
   *
   * Resolution order, checked in this priority because a query can be pinned three different ways
   * and only one is ever active at once:
-  *   1. `branch()` non-null (the query read a named branch, e.g. `SELECT * FROM t.branch_x`) --
-  *      resolved via `Table.snapshot(branchName)`, NOT fingerprinted as the branch NAME itself.
-  *      A branch is a MOVING pointer; fingerprinting the name would make two reads of a branch
-  *      whose tip advanced between them collide on an identical fingerprint despite reading
-  *      different data -- exactly the false-positive-resumption hazard invariant A-1 forbids.
-  *   2. `snapshotId()` non-null (the query pinned an exact snapshot or timestamp, e.g.
+  *   1. `snapshotId()` non-null (the query pinned an exact snapshot or timestamp, e.g.
   *      `VERSION AS OF <id>`) -- used directly; this is already the resolved point-in-time
   *      identity the query itself chose.
-  *   3. Neither set -- an ordinary unpinned read of the table's main branch -- resolved via
-  *      `Table.currentSnapshot()`, read once, at the moment this method is called.
-  * A table with no snapshot at all yet (created but never written to) resolves to
-  * [[IcebergFingerprintProvider.EmptyTableSentinel]] rather than crashing or hashing `null`.
+  *   2. Otherwise the read is rejected as non-reusable. This includes ordinary reads, named
+  *      branches, and empty tables: all are moving references whose value observed by this
+  *      post-execution provider may differ from the value the scan actually planned.
   *
-  * ==KNOWN GAP, NOT FIXED: the unpinned-read path (resolution step 3) can report a snapshot NEWER
-  * than what was actually read==
+  * ==Unpinned reads deliberately fail closed==
   * Confirmed empirically, not just reasoned about (see `IcebergFingerprintProviderSpec`'s
   * "KNOWN GAP" test): the same `BatchScanExec`/`SparkTable` OBJECT (verified via `eq`), asked for
   * its fingerprint twice -- once right after the query was planned, once again after the query
@@ -68,12 +61,12 @@ import org.apache.spark.resume.api.{FingerprintTarget, SourceFingerprint}
   * neither). Both require reflecting into a third-party connector's internals, which this
   * project's own public-API-only posture (docs/DESIGN.md §8) rules out doing silently.
   *
-  * Consequence, stated plainly: do not treat an `IcebergFingerprintProvider`-backed anchor as
-  * safe against a commit racing the capture listener. This is real production-relevant exposure
-  * for the unpinned-read path specifically -- a `VERSION AS OF`-pinned read is unaffected (its
-  * `snapshotId()` is fixed on the object, not re-resolved). Mitigating this properly needs
-  * resolving the fingerprint BEFORE execution rather than after (a capture-architecture change
-  * outside this provider's own scope -- see docs/DESIGN.md §14's Phase 2 Iceberg entry). */
+  * Earlier versions knowingly returned `Table.currentSnapshot()` here. That left a confirmed
+  * false-positive admission window, which is not an acceptable shipped degradation. This
+  * provider now throws [[IcebergFingerprintProvider.UnresolvedSnapshotException]] instead;
+  * `WholePlanFingerprint` turns a provider failure into a process-unique non-reusable leaf token.
+  * Correct support for ordinary reads requires resolving and persisting the scan's snapshot
+  * before execution, through a Spark/Iceberg extension point, rather than guessing afterward. */
 final class IcebergFingerprintProvider extends SourceFingerprint {
 
   override def supports(target: FingerprintTarget): Boolean = target.node match {
@@ -88,27 +81,21 @@ final class IcebergFingerprintProvider extends SourceFingerprint {
   }
 
   private def resolveSnapshotId(table: SparkTable): String = {
-    val branch = table.branch()
     val pinned = table.snapshotId()
-    if (branch != null) {
-      table.table().snapshot(branch) match {
-        case null => IcebergFingerprintProvider.EmptyTableSentinel
-        case snap => snap.snapshotId().toString
-      }
-    } else if (pinned != null) {
+    if (pinned != null) {
       pinned.toString
     } else {
-      table.table().currentSnapshot() match {
-        case null => IcebergFingerprintProvider.EmptyTableSentinel
-        case snap => snap.snapshotId().toString
-      }
+      throw new IcebergFingerprintProvider.UnresolvedSnapshotException(table.name())
     }
   }
 }
 
 object IcebergFingerprintProvider {
 
-  private val EmptyTableSentinel = "EMPTY-NO-SNAPSHOT-YET"
+  final class UnresolvedSnapshotException(tableName: String)
+      extends IllegalStateException(
+        s"Iceberg read $tableName has no immutable resolved snapshot id; refusing resumable " +
+          "fingerprinting for an unpinned or branch read")
 
   private def sha256Hex(s: String): String = {
     val md = MessageDigest.getInstance("SHA-256")

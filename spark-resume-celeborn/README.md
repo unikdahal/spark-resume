@@ -29,14 +29,19 @@ alongside `spark-resume-fs`'s real execution-skip proof) are the SAME gap, not a
 execution-skipping at all, which is exactly why `spark-resume-fs` exists as this repo's proof
 target instead.
 
-## A real safety check, not just a disclosed hazard
+## Identity limitation discovered by the upstream implementation
 
-A resuming driver launched under the same Celeborn `appUniqueId` as the run that produced an
-anchor risks silently colliding with that run's own wire state rather than cleanly reading its
-committed output — Celeborn scopes a shuffle's registration to the `appUniqueId` that created it,
-so reusing that id is a self-inflicted identity collision, not a resumption. `checkIdentityIsolation`
-here is a real, enforced, tested check for exactly that: it compares the anchor's producing
-`appUniqueId` against the resuming driver's own, and refuses with `IsolationConflict` on a match.
+Vanilla Celeborn offers no identity choice that makes recovery work. A different `appUniqueId` is
+isolated, but cannot address files whose shuffle keys contain the producer's identity. Reusing the
+producer's `appUniqueId` makes those keys addressable, but is unsafe without a driver epoch: a
+delayed producer driver can still heartbeat, unregister, allocate, or otherwise mutate the same
+application namespace.
+
+`checkIdentityIsolation` therefore reports a same-ID conflict for this vanilla, unfenced module;
+an `IsolationOk` for different IDs means only that their namespaces do not collide, not that
+reattachment is possible. The production design in `docs/RESUMABLE-SPARK-ROADMAP.md` uses a stable
+logical application namespace plus a monotonically fenced driver epoch. Do not work around the
+unsupported `reattach` operation by merely launching the replacement under a different ID.
 
 ## Running the tests — needs a real Celeborn cluster
 
